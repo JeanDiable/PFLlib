@@ -1,0 +1,6 @@
+/results
+/system/models
+*__pycache__*
+/dataset/Cifar100
+/dataset/Cifar10
+/dataset/MNIST
