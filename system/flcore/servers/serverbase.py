@@ -21,7 +21,17 @@ class Server(object):
         self.local_epochs = args.local_epochs
         self.batch_size = args.batch_size
         self.learning_rate = args.local_learning_rate
-        self.global_model = copy.deepcopy(args.model)
+
+        # PFCL: Controls whether each client has personalized model vs shared global model
+        self.pfcl_enable = getattr(args, 'pfcl_enable', False)
+
+        if not self.pfcl_enable:
+            # Traditional FL: maintain global model
+            self.global_model = copy.deepcopy(args.model)
+        else:
+            # PFCL: No global model, each client has personal model
+            self.global_model = None
+
         self.num_clients = args.num_clients
         self.join_ratio = args.join_ratio
         self.random_join_ratio = args.random_join_ratio
@@ -35,6 +45,40 @@ class Server(object):
         self.save_folder_name = args.save_folder_name
         self.top_cnt = args.top_cnt
         self.auto_break = args.auto_break
+
+        # CIL configuration: Controls whether tasks come in sequence vs all at once
+        self.cil_enable = getattr(args, 'cil_enable', False)
+        self.cil_rounds_per_class = getattr(args, 'cil_rounds_per_class', 0)
+        self.cil_batch_size = getattr(args, 'cil_batch_size', 1)
+        self.cil_order_groups = getattr(args, 'cil_order_groups', '')
+
+        # Client-specific task sequences (available when CIL enabled)
+        self.client_sequences = getattr(args, 'client_sequences', None)
+        if self.cil_enable:
+            if self.client_sequences:
+                # Parse client-specific sequences
+                self.client_task_sequences = self._parse_client_sequences(
+                    self.client_sequences
+                )
+                print(f"[CIL] Using client-specific task sequences")
+            else:
+                # All clients use same sequence (traditional CIL)
+                self.cil_order = self._parse_cil_order(
+                    getattr(args, 'cil_order', ''),
+                    self.cil_order_groups,
+                    args.num_classes,
+                    self.cil_batch_size,
+                )
+                self.client_task_sequences = {
+                    i: self.cil_order for i in range(self.num_clients)
+                }
+                print(f"[CIL] Using same task sequence for all clients")
+        else:
+            self.client_task_sequences = {}
+
+        # CIL evaluation metrics
+        self.cil_class_acc_hist = {}
+        self.active_max_class = -1
 
         self.clients = []
         self.selected_clients = []
@@ -128,11 +172,18 @@ class Server(object):
         for client in self.clients:
             start_time = time.time()
 
-            client.set_parameters(self.global_model)
-            # Broadcast CIL stage for strict synchronization (if available)
-            if hasattr(self, 'cil_enable') and self.cil_enable:
-                if hasattr(self, 'active_max_class'):
-                    client.cil_stage = getattr(self, 'active_max_class', -1)
+            # Model sharing: Send global model if not using personalized models
+            if not self.pfcl_enable and self.global_model is not None:
+                # Traditional FL: All clients receive the same global model
+                client.set_parameters(self.global_model)
+            # PFCL mode: Each client keeps their personal model (no sending needed)
+
+            # Task sequence: Send task sequence information if CIL enabled
+            if self.cil_enable:
+                # Send client's specific task sequence (could be same or different per client)
+                client_seq = self.client_task_sequences.get(client.id, [])
+                client.task_sequence = client_seq
+                client.cil_stage = getattr(self, 'active_max_class', -1)
 
             client.send_time_cost['num_rounds'] += 1
             client.send_time_cost['total_cost'] += 2 * (time.time() - start_time)
@@ -176,6 +227,12 @@ class Server(object):
             self.uploaded_weights[i] = w / tot_samples
 
     def aggregate_parameters(self):
+        if self.pfcl_enable:
+            # PFCL: No global model aggregation, each client keeps personal model
+            # Algorithm-specific knowledge sharing implemented in subclasses
+            return
+
+        # Traditional FL: aggregate into global model
         assert len(self.uploaded_models) > 0
 
         self.global_model = copy.deepcopy(self.uploaded_models[0])
@@ -428,3 +485,306 @@ class Server(object):
         ids = [c.id for c in self.new_clients]
 
         return ids, num_samples, tot_correct, tot_auc
+
+    # ---------- PFCL and CIL helper methods ----------
+    def _parse_client_sequences(self, sequences_input):
+        """
+        Parse client-specific task sequences from file or string format.
+        Expected format: "client_id:seq1,seq2;client_id2:seq1,seq2" or file path
+        """
+        client_sequences = {}
+
+        if os.path.exists(sequences_input):
+            # Read from file
+            with open(sequences_input, 'r') as f:
+                content = f.read().strip()
+        else:
+            content = sequences_input
+
+        try:
+            for client_spec in content.split(';'):
+                if ':' not in client_spec:
+                    continue
+                client_id_str, seq_str = client_spec.split(':', 1)
+                client_id = int(client_id_str.strip())
+
+                # Parse sequence: can be comma-separated classes or groups
+                if '|' in seq_str:  # Groups separated by |
+                    groups = []
+                    for group_str in seq_str.split('|'):
+                        group = [
+                            int(x.strip()) for x in group_str.split(',') if x.strip()
+                        ]
+                        if group:
+                            groups.append(group)
+                    client_sequences[client_id] = groups
+                else:  # Simple comma-separated sequence
+                    classes = [int(x.strip()) for x in seq_str.split(',') if x.strip()]
+                    # Convert to single-class groups for consistency
+                    client_sequences[client_id] = [[c] for c in classes]
+
+        except Exception as e:
+            print(f"[PFCL] Error parsing client sequences: {e}")
+            # Fallback to default sequence for all clients
+            default_seq = [[i] for i in range(self.num_classes)]
+            client_sequences = {i: default_seq for i in range(self.num_clients)}
+
+        return client_sequences
+
+    def _parse_cil_order(
+        self, order_str: str, group_str: str, num_classes: int, batch_size: int
+    ):
+        """
+        Parse CIL order from arguments (moved from FedFOT)
+        """
+        if group_str:
+            groups = []
+            for grp in group_str.split(';'):
+                ids = [int(x.strip()) for x in grp.split(',') if x.strip() != '']
+                if ids:
+                    groups.append(ids)
+            return groups if groups else [[c] for c in range(num_classes)]
+
+        base = (
+            [int(x.strip()) for x in order_str.split(',') if x.strip() != '']
+            if order_str
+            else list(range(num_classes))
+        )
+        if batch_size <= 1:
+            return [[c] for c in base]
+        stages = []
+        for i in range(0, len(base), batch_size):
+            stages.append(base[i : i + batch_size])
+        return stages
+
+    def _get_client_stage(self, client_id, current_round=None):
+        """
+        Get the current CIL stage for a client (only relevant if CIL is enabled)
+        """
+        if not self.cil_enable:
+            return -1
+
+        if current_round is None:
+            # Use client's local round counter or estimate
+            client = next((c for c in self.clients if c.id == client_id), None)
+            if client:
+                current_round = client.train_time_cost.get('num_rounds', 0)
+            else:
+                current_round = 0
+
+        client_seq = self.client_task_sequences.get(client_id, [])
+        if not client_seq or self.cil_rounds_per_class <= 0:
+            return -1
+
+        stage = min(len(client_seq) - 1, current_round // self.cil_rounds_per_class)
+        return max(0, stage)
+
+    # Knowledge sharing is algorithm-specific and implemented in subclasses
+
+    def evaluate_pfcl(self, current_round=None):
+        """
+        Evaluation for PFCL setting - evaluates each client's personal model
+        """
+        if not self.pfcl_enable:
+            return self.evaluate()
+
+        client_metrics = {}
+        overall_correct = 0
+        overall_samples = 0
+        overall_auc = 0
+
+        for client in self.clients:
+            # Test client's personal model
+            ct, ns, auc = client.test_metrics()
+            client_metrics[client.id] = {
+                'accuracy': ct / ns if ns > 0 else 0.0,
+                'samples': ns,
+                'auc': auc,
+            }
+            overall_correct += ct
+            overall_samples += ns
+            overall_auc += auc * ns
+
+        # Overall metrics across all clients
+        overall_acc = overall_correct / overall_samples if overall_samples > 0 else 0.0
+        overall_auc = overall_auc / overall_samples if overall_samples > 0 else 0.0
+
+        # Store metrics
+        self.rs_test_acc.append(overall_acc)
+
+        print(f"[PFCL] Overall Accuracy: {overall_acc:.4f}")
+        print(f"[PFCL] Overall AUC: {overall_auc:.4f}")
+
+        # CIL-specific evaluation (independent of PFCL)
+        if self.cil_enable:
+            self._evaluate_cil_metrics(client_metrics, current_round)
+
+        return client_metrics
+
+    def _evaluate_cil_metrics(self, client_metrics, current_round):
+        """
+        Evaluate CIL metrics (works for both PFCL and traditional FL)
+        """
+        if current_round is None:
+            current_round = len(self.rs_test_acc) - 1
+
+        # For each client, compute per-class accuracy
+        stage_metrics = {}
+
+        for client in self.clients:
+            client_stage = self._get_client_stage(client.id, current_round)
+            client_seq = self.client_task_sequences.get(client.id, [])
+
+            if client_stage < 0 or client_stage >= len(client_seq):
+                continue
+
+            # Compute per-class accuracy for this client
+            class_correct = {c: 0 for c in range(self.num_classes)}
+            class_total = {c: 0 for c in range(self.num_classes)}
+
+            testloader = client.load_test_data()
+            client.model.eval()
+
+            with torch.no_grad():
+                for x, y in testloader:
+                    if type(x) == type([]):
+                        x = x[0]
+                    x = x.to(self.device)
+                    y = y.to(self.device)
+                    outputs = client.model(x)
+                    preds = torch.argmax(outputs, dim=1)
+
+                    for cls in y.unique().tolist():
+                        cls = int(cls)
+                        mask = y == cls
+                        class_total[cls] += int(mask.sum().item())
+                        class_correct[cls] += int((preds[mask] == y[mask]).sum().item())
+
+            # Store per-class accuracies for this client at this stage
+            if client_stage not in stage_metrics:
+                stage_metrics[client_stage] = {}
+            if client.id not in stage_metrics[client_stage]:
+                stage_metrics[client_stage][client.id] = {}
+
+            for cls in range(self.num_classes):
+                tot = class_total[cls]
+                acc = (class_correct[cls] / tot) if tot > 0 else 0.0
+                stage_metrics[client_stage][client.id][cls] = acc
+
+        # Update history
+        for stage, client_dict in stage_metrics.items():
+            if stage not in self.cil_class_acc_hist:
+                self.cil_class_acc_hist[stage] = {}
+            self.cil_class_acc_hist[stage].update(client_dict)
+
+    def compute_cil_metrics(self):
+        """
+        Compute final ACC and FGT metrics for CIL/PFCL
+        """
+        if not self.cil_enable or not hasattr(self, 'cil_class_acc_hist'):
+            print('[CIL] No CIL metrics available')
+            return
+
+        if not self.cil_class_acc_hist:
+            print('[CIL] No per-class history captured')
+            return
+
+        final_stage = max(self.cil_class_acc_hist.keys())
+
+        if self.pfcl_enable:
+            # PFCL + CIL: compute metrics per client, then average
+            client_ACCs = []
+            client_FGTs = []
+
+            for client_id in range(self.num_clients):
+                client_seq = self.client_task_sequences.get(client_id, [])
+                if not client_seq:
+                    continue
+
+                # Final accuracies for this client
+                final_accs = self.cil_class_acc_hist.get(final_stage, {}).get(
+                    client_id, {}
+                )
+                if not final_accs:
+                    continue
+
+                # ACC: mean per-class accuracy for classes in this client's sequence
+                client_classes = set()
+                for stage_classes in client_seq:
+                    client_classes.update(stage_classes)
+                client_final_accs = [final_accs.get(c, 0.0) for c in client_classes]
+                client_ACC = (
+                    float(np.mean(client_final_accs)) if client_final_accs else 0.0
+                )
+                client_ACCs.append(client_ACC)
+
+                # FGT: forgetting for this client
+                client_FGT_vals = []
+                for stage, stage_classes in enumerate(client_seq):
+                    stage_accs = self.cil_class_acc_hist.get(stage, {}).get(
+                        client_id, {}
+                    )
+                    for cls in stage_classes:
+                        acc_at_stage = stage_accs.get(cls, 0.0)
+                        acc_final = final_accs.get(cls, 0.0)
+                        client_FGT_vals.append(acc_at_stage - acc_final)
+
+                client_FGT = float(np.mean(client_FGT_vals)) if client_FGT_vals else 0.0
+                client_FGTs.append(client_FGT)
+
+            # Overall metrics
+            overall_ACC = float(np.mean(client_ACCs)) if client_ACCs else 0.0
+            overall_FGT = float(np.mean(client_FGTs)) if client_FGTs else 0.0
+
+            print(f"[PFCL-CIL] Overall ACC (mean per-client): {overall_ACC:.4f}")
+            print(f"[PFCL-CIL] Overall FGT (mean per-client): {overall_FGT:.4f}")
+
+        else:
+            # Traditional FL + CIL: global metrics
+            # Aggregate across all clients for final accuracies
+            final_class_correct = {c: 0 for c in range(self.num_classes)}
+            final_class_total = {c: 0 for c in range(self.num_classes)}
+
+            for client_id, class_accs in self.cil_class_acc_hist.get(
+                final_stage, {}
+            ).items():
+                for cls, acc in class_accs.items():
+                    if isinstance(acc, (int, float)) and acc > 0:
+                        final_class_correct[
+                            cls
+                        ] += acc  # Assume this represents correct/total
+                        final_class_total[cls] += 1
+
+            final_accs = {}
+            for cls in range(self.num_classes):
+                if final_class_total[cls] > 0:
+                    final_accs[cls] = final_class_correct[cls] / final_class_total[cls]
+                else:
+                    final_accs[cls] = 0.0
+
+            # ACC
+            valid_final = [final_accs.get(c, 0.0) for c in range(self.num_classes)]
+            ACC = float(np.mean(valid_final))
+
+            # FGT: need to implement similar aggregation across stages
+            # For now, simplified version
+            FGT_vals = []
+            for stage in self.cil_class_acc_hist.keys():
+                if stage == final_stage:
+                    continue
+                stage_accs = {}
+                for client_id, class_accs in self.cil_class_acc_hist[stage].items():
+                    for cls, acc in class_accs.items():
+                        if cls not in stage_accs:
+                            stage_accs[cls] = []
+                        stage_accs[cls].append(acc)
+
+                for cls, acc_list in stage_accs.items():
+                    avg_acc_at_stage = np.mean(acc_list)
+                    final_acc = final_accs.get(cls, 0.0)
+                    FGT_vals.append(avg_acc_at_stage - final_acc)
+
+            FGT = float(np.mean(FGT_vals)) if FGT_vals else 0.0
+
+            print(f"[CIL] Final ACC (mean per-class): {ACC:.4f}")
+            print(f"[CIL] Average Forgetting (FGT): {FGT:.4f}")

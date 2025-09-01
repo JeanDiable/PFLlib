@@ -9,11 +9,10 @@ from flcore.clients.clientbase import Client
 class clientAVG(Client):
     def __init__(self, args, id, train_samples, test_samples, **kwargs):
         super().__init__(args, id, train_samples, test_samples, **kwargs)
-        # FOT state read-only mirror
+        # FOT: Task schedule for reference (read-only)
         self.task_schedule = self._parse_task_schedule(
             getattr(args, 'task_schedule', '')
         )
-        self.round_idx = 0
 
     def train(self):
         trainloader = self.load_train_data()
@@ -49,9 +48,8 @@ class clientAVG(Client):
         self.train_time_cost['num_rounds'] += 1
         self.train_time_cost['total_cost'] += time.time() - start_time
 
-        # After local training, attempt activation collection; server will expand only at boundaries
+        # FOT: Collect activations for GPSE (works for both traditional and PFCL modes)
         self._collect_and_attach_activation_payload()
-        self.round_idx += 1
 
     # ---------- FOT client helpers ----------
     def _parse_task_schedule(self, sched_str):
@@ -63,34 +61,39 @@ class clientAVG(Client):
             return set()
 
     def _collect_and_attach_activation_payload(self):
-        # Stub: In PFLlib sync, there's no native payload channel. We attach to client object
-        # so that server.receive_models() can read from self and buffer into activation_dict.
+        """Collect activations and attach to client for server retrieval"""
         try:
             payload = self.collect_activations()
             self.activation_payload = payload
         except Exception as e:
-            print(f"[FOT][Client {self.id}] activation collection failed: {e}")
+            print(f"[FOT][Client {self.id}] Activation collection failed: {e}")
+            self.activation_payload = None
 
     def collect_activations(self):
         """
-        Build per-layer activation matrices and return dict: layer_name -> (Y, r, b)
-        Uses generic collectors for Conv2d and Linear (AlexNet, ResNet18, Transformer).
+        Collect activation matrices for GPSE basis expansion.
+
+        Returns:
+            dict: layer_name -> (Y, r, b) where:
+                - Y: randomized projection of residualized activations
+                - r: residual ratio (fraction of energy not explained by current basis)
+                - b: number of samples contributing to this activation matrix
         """
         from flcore.trainmodel.activation_collectors import (
             collect_activations_for_model,
         )
 
         trainloader = self.load_train_data()
+        x, y = next(iter(trainloader))  # Single batch is sufficient
 
-        # one small batch is enough
-        x, y = next(iter(trainloader))
-        # try to pass orth_set snapshot if available on client (not by default)
+        # Use orthogonal basis snapshot sent by server
         orth_set = getattr(self, 'orth_set_snapshot', None)
-        proj_w = float(getattr(self.args, 'gpse_proj_width_factor', 5.0))
+        proj_width_factor = float(getattr(self.args, 'gpse_proj_width_factor', 5.0))
+
         return collect_activations_for_model(
             model=self.model,
             batch_x=x,
             device=self.device,
             orth_set=orth_set,
-            proj_width_factor=proj_w,
+            proj_width_factor=proj_width_factor,
         )

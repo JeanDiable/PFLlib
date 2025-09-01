@@ -1,7 +1,8 @@
 import time
+from threading import Thread
+
 from flcore.clients.clientavg import clientAVG
 from flcore.servers.serverbase import Server
-from threading import Thread
 
 
 class FedAvg(Server):
@@ -18,17 +19,47 @@ class FedAvg(Server):
         # self.load_model()
         self.Budget = []
 
+    def _update_client_stages(self, current_round):
+        """
+        Update CIL stage (only relevant if CIL is enabled)
+        """
+        if not self.cil_enable:
+            return
+
+        if self.cil_rounds_per_class <= 0:
+            return
+
+        # Traditional CIL: all clients at same stage (synchronized)
+        global_stage = min(
+            len(self.client_task_sequences.get(0, [])) - 1,
+            current_round // self.cil_rounds_per_class,
+        )
+        self.active_max_class = max(0, global_stage)
+
+        for client in self.clients:
+            client.cil_stage = self.active_max_class
+
+    # FedAvg in PFCL mode: Pure local learning, no explicit knowledge sharing
 
     def train(self):
-        for i in range(self.global_rounds+1):
+        for i in range(self.global_rounds + 1):
             s_t = time.time()
+
+            # CIL: Update stage for continual learning if enabled
+            if self.cil_enable:
+                self._update_client_stages(i)
+
             self.selected_clients = self.select_clients()
             self.send_models()
 
-            if i%self.eval_gap == 0:
+            if i % self.eval_gap == 0:
                 print(f"\n-------------Round number: {i}-------------")
-                print("\nEvaluate global model")
-                self.evaluate()
+                if self.pfcl_enable:
+                    print("\nEvaluate personalized models")
+                    self.evaluate_pfcl(i)
+                else:
+                    print("\nEvaluate global model")
+                    self.evaluate()
 
             for client in self.selected_clients:
                 client.train()
@@ -39,14 +70,16 @@ class FedAvg(Server):
             # [t.join() for t in threads]
 
             self.receive_models()
-            if self.dlg_eval and i%self.dlg_gap == 0:
+            if self.dlg_eval and i % self.dlg_gap == 0:
                 self.call_dlg(i)
             self.aggregate_parameters()
 
             self.Budget.append(time.time() - s_t)
-            print('-'*25, 'time cost', '-'*25, self.Budget[-1])
+            print('-' * 25, 'time cost', '-' * 25, self.Budget[-1])
 
-            if self.auto_break and self.check_done(acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt):
+            if self.auto_break and self.check_done(
+                acc_lss=[self.rs_test_acc], top_cnt=self.top_cnt
+            ):
                 break
 
         print("\nBest accuracy.")
@@ -54,14 +87,22 @@ class FedAvg(Server):
         #     self.rs_train_acc), min(self.rs_train_loss))
         print(max(self.rs_test_acc))
         print("\nAverage time cost per round.")
-        print(sum(self.Budget[1:])/len(self.Budget[1:]))
+        print(sum(self.Budget[1:]) / len(self.Budget[1:]))
+
+        # Compute final CIL metrics if enabled
+        if self.cil_enable:
+            self.compute_cil_metrics()
 
         self.save_results()
-        self.save_global_model()
+        if not self.pfcl_enable:  # Only save global model if not in personalized mode
+            self.save_global_model()
 
         if self.num_new_clients > 0:
             self.eval_new_clients = True
             self.set_new_clients(clientAVG)
             print(f"\n-------------Fine tuning round-------------")
             print("\nEvaluate new clients")
-            self.evaluate()
+            if self.pfcl_enable:
+                self.evaluate_pfcl()
+            else:
+                self.evaluate()

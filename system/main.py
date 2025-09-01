@@ -719,6 +719,22 @@ if __name__ == "__main__":
         help="Optional groups separated by ';', e.g., '0,1,2,3,4;5,6,7,8,9'",
     )
 
+    # Personalized Federated Learning (PFCL)
+    parser.add_argument(
+        '-pfcl',
+        "--pfcl_enable",
+        type=bool,
+        default=False,
+        help="Enable Personalized FL: each client maintains own model (vs shared global model)",
+    )
+    parser.add_argument(
+        '-client_seq',
+        "--client_sequences",
+        type=str,
+        default="",
+        help="Client-specific task sequences. Format: 'client_id:seq1,seq2;client_id2:seq1,seq2' or file path",
+    )
+
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id

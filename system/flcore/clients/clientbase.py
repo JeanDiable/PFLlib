@@ -33,6 +33,17 @@ class Client(object):
         self.local_epochs = args.local_epochs
         self.few_shot = args.few_shot
 
+        # PFCL: Controls whether this client has personalized model
+        self.pfcl_enable = getattr(args, 'pfcl_enable', False)
+
+        # CIL: Controls whether tasks come in sequence
+        self.cil_enable = getattr(args, 'cil_enable', False)
+        self.cil_rounds_per_class = getattr(args, 'cil_rounds_per_class', 0)
+
+        # Task sequence information (set by server if CIL enabled)
+        self.task_sequence = []  # List of class groups
+        self.cil_stage = -1  # Current CIL stage
+
         # check BatchNorm
         self.has_BatchNorm = False
         for layer in self.model.children():
@@ -72,8 +83,15 @@ class Client(object):
         return DataLoader(test_data, batch_size, drop_last=False, shuffle=True)
 
     def set_parameters(self, model):
-        for new_param, old_param in zip(model.parameters(), self.model.parameters()):
-            old_param.data = new_param.data.clone()
+        # PFCL: Only update parameters if not in personalized mode
+        # In personalized mode, each client keeps their own model parameters
+        if not self.pfcl_enable or not hasattr(self, '_model_initialized'):
+            for new_param, old_param in zip(
+                model.parameters(), self.model.parameters()
+            ):
+                old_param.data = new_param.data.clone()
+            if self.pfcl_enable:
+                self._model_initialized = True
 
     def clone_model(self, model, target):
         for param, target_param in zip(model.parameters(), target.parameters()):
@@ -188,52 +206,63 @@ class Client(object):
     # def model_exists():
     #     return os.path.exists(os.path.join("models", "server" + ".pt"))
 
-    # ---------- CIL filtering ----------
+    # ---------- CIL filtering (updated for PFCL) ----------
     def _maybe_cil_filter(self, data_list, is_train: bool):
-        cil_enable = getattr(self.args, 'cil_enable', False)
-        rounds_per_class = getattr(self.args, 'cil_rounds_per_class', 0)
-        if not cil_enable or rounds_per_class <= 0:
+        if not self.cil_enable or self.cil_rounds_per_class <= 0:
             return data_list
 
-        # server sets active_max_class; clients read from global model path might not access server directly.
-        # We map round estimate via local counters as proxy: use train_time_cost['num_rounds'].
-        # Server-synchronized stage if provided; else local estimate
+        # Use client-specific task sequence if CIL enabled and sequence available
+        if self.cil_enable and hasattr(self, 'task_sequence') and self.task_sequence:
+            stages = self.task_sequence
+        elif self.cil_enable:
+            # Fallback to global CIL order
+            order_groups = getattr(self.args, 'cil_order_groups', '')
+            batch_size = getattr(self.args, 'cil_batch_size', 1)
+            order_str = getattr(self.args, 'cil_order', '')
+            if order_groups:
+                groups = []
+                for grp in order_groups.split(';'):
+                    ids = [int(x.strip()) for x in grp.split(',') if x.strip() != '']
+                    if ids:
+                        groups.append(ids)
+                stages = groups if groups else [[c] for c in range(self.num_classes)]
+            else:
+                base = (
+                    [int(x.strip()) for x in order_str.split(',') if x.strip() != '']
+                    if order_str
+                    else list(range(self.num_classes))
+                )
+                if batch_size <= 1:
+                    stages = [[c] for c in base]
+                else:
+                    stages = [
+                        base[i : i + batch_size]
+                        for i in range(0, len(base), batch_size)
+                    ]
+
+        # Determine current stage
         stage = getattr(self, 'cil_stage', None)
         if stage is None:
-            stage = int(self.train_time_cost['num_rounds'] // rounds_per_class)
-        # classes included up to 'stage' in cil_order/groups
-        order_groups = getattr(self.args, 'cil_order_groups', '')
-        batch_size = getattr(self.args, 'cil_batch_size', 1)
-        order_str = getattr(self.args, 'cil_order', '')
-        if order_groups:
-            groups = []
-            for grp in order_groups.split(';'):
-                ids = [int(x.strip()) for x in grp.split(',') if x.strip() != '']
-                if ids:
-                    groups.append(ids)
-            stages = groups if groups else [[c] for c in range(self.num_classes)]
-        else:
-            base = (
-                [int(x.strip()) for x in order_str.split(',') if x.strip() != '']
-                if order_str
-                else list(range(self.num_classes))
-            )
-            if batch_size <= 1:
-                stages = [[c] for c in base]
-            else:
-                stages = [
-                    base[i : i + batch_size] for i in range(0, len(base), batch_size)
-                ]
+            # Estimate based on local round counter
+            stage = int(self.train_time_cost['num_rounds'] // self.cil_rounds_per_class)
+
         # allowed classes
         if is_train:
             # Train on current stage classes only (not cumulative)
             current = min(stage, len(stages) - 1)
-            allowed = set(stages[current]) if current >= 0 else set(stages[0])
+            allowed = (
+                set(stages[current])
+                if current >= 0 and current < len(stages)
+                else set()
+            )
+            if not allowed and stages:  # fallback to first stage
+                allowed = set(stages[0])
         else:
             # Eval on cumulative classes seen so far
             allowed = set()
             for s in range(min(stage + 1, len(stages))):
-                allowed.update(stages[s])
+                if s >= 0 and s < len(stages):
+                    allowed.update(stages[s])
 
         class FilteredDataset(Dataset):
             def __init__(self, data, allowed):
@@ -250,36 +279,77 @@ class Client(object):
         return FilteredDataset(data_list, allowed)
 
     def _get_allowed_classes(self):
-        cil_enable = getattr(self.args, 'cil_enable', False)
-        rounds_per_class = getattr(self.args, 'cil_rounds_per_class', 0)
-        if not cil_enable or rounds_per_class <= 0:
+        if not self.cil_enable or self.cil_rounds_per_class <= 0:
             return None
+
+        # Use client-specific task sequence if CIL enabled
+        if self.cil_enable and hasattr(self, 'task_sequence') and self.task_sequence:
+            stages = self.task_sequence
+        elif self.cil_enable:
+            # Fallback to global CIL order
+            order_groups = getattr(self.args, 'cil_order_groups', '')
+            batch_size = getattr(self.args, 'cil_batch_size', 1)
+            order_str = getattr(self.args, 'cil_order', '')
+            if order_groups:
+                groups = []
+                for grp in order_groups.split(';'):
+                    ids = [int(x.strip()) for x in grp.split(',') if x.strip() != '']
+                    if ids:
+                        groups.append(ids)
+                stages = groups if groups else [[c] for c in range(self.num_classes)]
+            else:
+                base = (
+                    [int(x.strip()) for x in order_str.split(',') if x.strip() != '']
+                    if order_str
+                    else list(range(self.num_classes))
+                )
+                if batch_size <= 1:
+                    stages = [[c] for c in base]
+                else:
+                    stages = [
+                        base[i : i + batch_size]
+                        for i in range(0, len(base), batch_size)
+                    ]
+
         stage = getattr(self, 'cil_stage', None)
         if stage is None:
-            stage = int(self.train_time_cost['num_rounds'] // rounds_per_class)
-        order_groups = getattr(self.args, 'cil_order_groups', '')
-        batch_size = getattr(self.args, 'cil_batch_size', 1)
-        order_str = getattr(self.args, 'cil_order', '')
-        if order_groups:
-            groups = []
-            for grp in order_groups.split(';'):
-                ids = [int(x.strip()) for x in grp.split(',') if x.strip() != '']
-                if ids:
-                    groups.append(ids)
-            stages = groups if groups else [[c] for c in range(self.num_classes)]
-        else:
-            base = (
-                [int(x.strip()) for x in order_str.split(',') if x.strip() != '']
-                if order_str
-                else list(range(self.num_classes))
-            )
-            if batch_size <= 1:
-                stages = [[c] for c in base]
-            else:
-                stages = [
-                    base[i : i + batch_size] for i in range(0, len(base), batch_size)
-                ]
+            stage = int(self.train_time_cost['num_rounds'] // self.cil_rounds_per_class)
+
         allowed = set()
         for s in range(min(stage + 1, len(stages))):
-            allowed.update(stages[s])
+            if s >= 0 and s < len(stages):
+                allowed.update(stages[s])
+        return allowed
+
+    def get_current_task_classes(self):
+        """
+        Get classes for the current task/stage (only relevant if CIL enabled)
+        """
+        if not self.cil_enable:
+            return set(range(self.num_classes))  # All classes available
+
+        if not hasattr(self, 'task_sequence') or not self.task_sequence:
+            return set(range(self.num_classes))
+
+        stage = getattr(self, 'cil_stage', 0)
+        if stage < 0 or stage >= len(self.task_sequence):
+            return set()
+
+        return set(self.task_sequence[stage])
+
+    def get_cumulative_classes(self):
+        """
+        Get all classes seen up to current stage (only relevant if CIL enabled)
+        """
+        if not self.cil_enable:
+            return set(range(self.num_classes))  # All classes available
+
+        if not hasattr(self, 'task_sequence') or not self.task_sequence:
+            return set(range(self.num_classes))
+
+        stage = getattr(self, 'cil_stage', 0)
+        allowed = set()
+        for s in range(min(stage + 1, len(self.task_sequence))):
+            if s >= 0:
+                allowed.update(self.task_sequence[s])
         return allowed

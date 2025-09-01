@@ -10,7 +10,7 @@ class FedFOT(FedAvg):
     def __init__(self, args, times):
         super().__init__(args, times)
 
-        # FOT state
+        # FOT parameters
         self.epsilon = getattr(args, 'epsilon', 0.90)
         self.eps_inc = getattr(args, 'eps_inc', 0.02)
         self.task_schedule = self._parse_task_schedule(
@@ -18,57 +18,57 @@ class FedFOT(FedAvg):
         )
         self.gpse_proj_width_factor = getattr(args, 'gpse_proj_width_factor', 5.0)
 
-        # layer participation list and basis store
-        self.orth_layer_names = self._build_orth_layer_names(self.global_model)
-        self.orth_set = {name: None for name in self.orth_layer_names}
+        # Determine model template for layer names
+        if not self.pfcl_enable and self.global_model is not None:
+            template_model = self.global_model
+        else:
+            template_model = copy.deepcopy(args.model)
+        self.orth_layer_names = self._build_orth_layer_names(template_model)
 
-        # activation payload buffer: client_id -> {layer_name: (Y, r, b)}
-        self.activation_dict = {}
+        # Orthogonal basis storage
+        if self.pfcl_enable:
+            # PFCL: Each client has its own orthogonal basis
+            self.client_orth_sets = {}  # client_id -> {layer_name: U_basis}
+        else:
+            # Traditional FOT: Shared global basis
+            self.orth_set = {name: None for name in self.orth_layer_names}
 
-        # CIL config
-        self.cil_enable = getattr(args, 'cil_enable', False)
-        self.cil_rounds_per_class = getattr(args, 'cil_rounds_per_class', 0)
-        self.cil_batch_size = getattr(args, 'cil_batch_size', 1)
-        self.cil_order_groups = getattr(args, 'cil_order_groups', '')
-        self.cil_order = self._parse_cil_order(
-            getattr(args, 'cil_order', ''),
-            self.cil_order_groups,
-            args.num_classes,
-            self.cil_batch_size,
-        )
-        self.active_max_class = -1
+        # Activation collection buffer
+        self.activation_dict = {}  # client_id -> {layer_name: (Y, r, b)}
 
-    # ---------- hooks ----------
     def aggregate_parameters(self):
-        # Preserve previous global weights
-        prev_global = copy.deepcopy(self.global_model)
-
-        # Standard FedAvg aggregation
-        super().aggregate_parameters()
-
-        # Apply FedProject: project aggregated update along orthogonal complement of bases
-        self._apply_projected_update(prev_global, self.global_model)
+        if self.pfcl_enable:
+            # PFCL: Apply FedProject to each client's personal model
+            self._apply_pfcl_fedproject()
+        else:
+            # Traditional FOT: Apply FedProject to global model
+            prev_global = copy.deepcopy(self.global_model)
+            super().aggregate_parameters()  # FedAvg aggregation first
+            self._apply_fedproject_global(prev_global, self.global_model)
 
     def receive_models(self):
         super().receive_models()
         # Note: activation payloads would be appended here from clients if implemented
 
     def train(self):
-        # override to insert task-boundary GPSE
         for i in range(self.global_rounds + 1):
             s_t = __import__('time').time()
-            # CIL stage for this round (set BEFORE sending models)
+
+            # CIL stage handling (if enabled)
             if self.cil_enable:
-                stage = self._cil_stage(i)
-                self.active_max_class = stage
+                self._update_client_stages(i)
 
             self.selected_clients = self.select_clients()
             self.send_models()
 
             if i % self.eval_gap == 0:
                 print(f"\n-------------Round number: {i}-------------")
-                print("\nEvaluate global model")
-                self.evaluate()
+                if self.pfcl_enable:
+                    print("\nEvaluate personalized FOT models")
+                    self.evaluate_pfcl(i)
+                else:
+                    print("\nEvaluate global FOT model")
+                    self.evaluate()
 
             for client in self.selected_clients:
                 client.train()
@@ -78,23 +78,14 @@ class FedFOT(FedAvg):
                 self.call_dlg(i)
             self.aggregate_parameters()
 
-            # Derive task_schedule from CIL and merge with provided schedule
-            if self.cil_enable and self.cil_rounds_per_class > 0:
-                stages = len(self.cil_order)
-                derived = set(
-                    ((s + 1) * self.cil_rounds_per_class - 1) for s in range(stages)
-                )
-                self.task_schedule = set(self.task_schedule) | derived
-
-            # GPSE at task boundary and stage-end evaluation snapshot
-            if i in self.task_schedule:
-                # Capture per-class metrics at stage end (after training and aggregation)
-                self.evaluate()
+            # Check for task boundaries and trigger GPSE
+            if self._is_task_boundary(i):
+                print(f"[FOT] Task boundary at round {i}, expanding bases")
                 self.expand_orth_set()
-                # increment epsilon
                 self.epsilon = min(0.999, self.epsilon + self.eps_inc)
-                # clear activations after expansion
                 self.activation_dict.clear()
+                if not self.pfcl_enable:
+                    self.evaluate()  # Evaluation snapshot at task boundary
 
             self.Budget.append(__import__('time').time() - s_t)
             print('-' * 25, 'time cost', '-' * 25, self.Budget[-1])
@@ -109,12 +100,12 @@ class FedFOT(FedAvg):
         print("\nAverage time cost per round.")
         print(sum(self.Budget[1:]) / len(self.Budget[1:]))
 
-        # If CIL, compute final ACC and FGT
         if self.cil_enable:
-            self._compute_and_print_cil_metrics()
+            self.compute_cil_metrics()
 
         self.save_results()
-        self.save_global_model()
+        if not self.pfcl_enable:
+            self.save_global_model()
 
     # ---------- FOT internals ----------
     def _parse_task_schedule(self, sched_str):
@@ -138,233 +129,293 @@ class FedFOT(FedAvg):
                 names.append(name)
         return names
 
-    def _apply_projected_update(self, prev_global: nn.Module, new_global: nn.Module):
+    def _apply_pfcl_fedproject(self):
+        """PFCL: Apply FedProject to each client's personal model"""
+        for client in self.clients:
+            if client.id not in self.uploaded_ids:
+                continue
+
+            # Get client's current model and previous state
+            if not hasattr(client, '_prev_model_state'):
+                client._prev_model_state = copy.deepcopy(client.model.state_dict())
+                continue  # Skip first round
+
+            prev_state = client._prev_model_state
+            current_state = client.model.state_dict()
+
+            # Apply FedProject using client's orthogonal basis
+            client_basis = self.client_orth_sets.get(client.id, {})
+            projected_state = self._project_model_update(
+                prev_state, current_state, client_basis
+            )
+
+            # Update client model with projected parameters
+            client.model.load_state_dict(projected_state)
+
+            # Store current state for next round
+            client._prev_model_state = copy.deepcopy(projected_state)
+
+    def _apply_fedproject_global(self, prev_global, new_global):
+        """Traditional FOT: Apply FedProject to global model"""
         with torch.no_grad():
             for (name, p_prev), (_, p_new) in zip(
                 prev_global.named_parameters(), new_global.named_parameters()
             ):
                 if name not in self.orth_set or self.orth_set[name] is None:
                     continue
-                U = self.orth_set[name]  # shape: (d, k)
-                if p_new.data.shape != p_prev.data.shape:
-                    continue
-                g = p_prev.data - p_new.data  # server-side effective update
 
-                if g.ndim == 4:
-                    # conv: [out_c, in_c, k_h, k_w] -> [out_c, -1]
-                    out_c = g.shape[0]
-                    g2d = g.view(out_c, -1)
-                    # project each row vector along columns of U (U is aligned to flattened filter dim)
-                    # reshape to (out_c * d, 1) batch projection by matrix multiply
-                    # Compute projection: g2d = g2d - (g2d @ U) @ U.T
-                    proj = (g2d @ U) @ U.t()
-                    g2d = g2d - proj
-                    g_proj = g2d.view_as(g)
-                elif g.ndim == 2:
-                    # linear: [out, in]; follow FedML: project on transpose: (I - U U^T) g^T, then transpose back
-                    gT = g.t()  # [in, out]
-                    # Ensure basis dimension matches input dimension
-                    if U.shape[0] != gT.shape[0]:
-                        # skip if mismatch
-                        continue
-                    # proj_left = U (U^T gT)
-                    proj_left = U @ (U.t() @ gT)
-                    gT_proj = gT - proj_left
-                    g_proj = gT_proj.t()
-                else:
-                    continue
+                U = self.orth_set[name]
+                g = p_prev.data - p_new.data  # Update direction
 
-                # apply projected update: w_new = w_prev - g_proj
+                # Apply orthogonal projection: g_proj = g - UU^T g
+                g_proj = self._project_gradient(g, U)
+
+                # Apply projected update
                 p_new.data = p_prev.data - g_proj
 
+    def _project_model_update(self, prev_state, current_state, client_basis):
+        """Project model update using client's orthogonal basis"""
+        projected_state = {}
+
+        for param_name, prev_param in prev_state.items():
+            current_param = current_state[param_name]
+
+            if param_name not in client_basis or client_basis[param_name] is None:
+                projected_state[param_name] = current_param
+                continue
+
+            U = client_basis[param_name]
+            g = prev_param - current_param  # Update direction
+
+            # Apply orthogonal projection
+            g_proj = self._project_gradient(g, U)
+
+            # Apply projected update
+            projected_state[param_name] = prev_param - g_proj
+
+        return projected_state
+
+    def _project_gradient(self, g, U):
+        """Apply orthogonal projection to gradient/update"""
+        if g.ndim == 4:  # Conv layer: [out_c, in_c, h, w]
+            out_c = g.shape[0]
+            g_flat = g.view(out_c, -1)  # [out_c, in_c*h*w]
+            # Project: g_flat = g_flat - (g_flat @ U) @ U^T
+            proj = (g_flat @ U) @ U.t()
+            g_proj = (g_flat - proj).view_as(g)
+        elif g.ndim == 2:  # Linear layer: [out, in]
+            g_T = g.t()  # [in, out]
+            if U.shape[0] != g_T.shape[0]:
+                return g  # Dimension mismatch, skip projection
+            # Project on transpose: g_T = g_T - U @ (U^T @ g_T)
+            proj = U @ (U.t() @ g_T)
+            g_proj = (g_T - proj).t()
+        else:
+            return g  # Skip unsupported dimensions
+
+        return g_proj
+
     def expand_orth_set(self):
-        # Aggregate Y, r, b across uploaded clients (placeholder: expects self.activation_dict populated)
+        """
+        Expand orthogonal basis sets using GPSE
+        """
         if len(self.activation_dict) == 0:
-            print('[FOT] No activation payloads to expand basis.')
+            print('[FOT] No activation payloads to expand basis')
             return
 
-        device = next(self.global_model.parameters()).device
-        # layer-wise aggregation
-        layer_to_payloads = {ln: [] for ln in self.orth_layer_names}
-        for _, layer_dict in self.activation_dict.items():
-            for ln, triple in layer_dict.items():
-                layer_to_payloads.setdefault(ln, []).append(triple)
+        # Get device
+        if self.pfcl_enable and self.clients:
+            device = next(self.clients[0].model.parameters()).device
+        elif not self.pfcl_enable and self.global_model is not None:
+            device = next(self.global_model.parameters()).device
+        else:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        for ln, triples in layer_to_payloads.items():
-            if len(triples) == 0:
+        if self.pfcl_enable:
+            # PFCL: Expand each client's basis individually
+            for client_id in self.activation_dict.keys():
+                self._expand_client_basis(client_id, device)
+        else:
+            # Traditional FOT: Expand shared global basis
+            self._expand_global_basis(device)
+
+    def _expand_global_basis(self, device):
+        """Traditional FOT: Expand shared global basis using aggregated activations"""
+        layer_payloads = {ln: [] for ln in self.orth_layer_names}
+
+        # Aggregate activations from all clients
+        for client_activations in self.activation_dict.values():
+            for layer_name, (Y, r, b) in client_activations.items():
+                if layer_name in layer_payloads:
+                    layer_payloads[layer_name].append((Y, r, b))
+
+        # Process each layer
+        for layer_name, payloads in layer_payloads.items():
+            if not payloads:
                 continue
-            # sum Y and compute weighted residual ratio
+
+            # Aggregate Y matrices and compute weighted residual ratio
             Y_sum = None
-            total_b = 0
-            r_weighted = 0.0
-            for Y, r, b in triples:
+            total_samples = 0
+            weighted_residual = 0.0
+
+            for Y, r, b in payloads:
                 if Y_sum is None:
                     Y_sum = Y.clone().to(device)
                 else:
-                    Y_sum = Y_sum + Y.to(device)
-                total_b += int(b)
-                r_weighted += float(r) * int(b)
-            if Y_sum is None or total_b == 0:
+                    Y_sum += Y.to(device)
+                total_samples += int(b)
+                weighted_residual += float(r) * int(b)
+
+            if Y_sum is None or total_samples == 0:
                 continue
-            r_bar = r_weighted / total_b
 
-            # adaptive epsilon'
-            eps_prime = self._compute_eps_prime(self.epsilon, r_bar)
+            avg_residual = weighted_residual / total_samples
 
-            # SVD on Y_sum
+            # Compute adaptive threshold
+            eps_prime = self._compute_adaptive_epsilon(self.epsilon, avg_residual)
+
+            # SVD and basis selection
             try:
                 U_hat, S, _ = torch.linalg.svd(Y_sum, full_matrices=False)
             except RuntimeError:
-                # fallback to CPU
                 U_hat, S, _ = torch.linalg.svd(Y_sum.cpu(), full_matrices=False)
-                U_hat = U_hat.to(device)
-                S = S.to(device)
+                U_hat, S = U_hat.to(device), S.to(device)
 
-            # select top-k by cumulative energy
+            # Select top-k components by energy threshold
             energy = S**2
             cum_energy = torch.cumsum(energy, dim=0)
             total_energy = energy.sum() + 1e-12
-            ratio = cum_energy / total_energy
-            k = int((ratio >= eps_prime).nonzero(as_tuple=True)[0][0].item()) + 1
-            U_new = U_hat[:, :k]  # (d, k)
+            energy_ratio = cum_energy / total_energy
 
-            # concat with existing basis and re-orthonormalize
-            if self.orth_set.get(ln, None) is None:
-                U_concat = U_new
+            k = int((energy_ratio >= eps_prime).nonzero(as_tuple=True)[0][0].item()) + 1
+            U_new = U_hat[:, :k]
+
+            # Concatenate with existing basis and re-orthogonalize
+            if self.orth_set.get(layer_name) is None:
+                self.orth_set[layer_name] = U_new.detach()
             else:
-                U_concat = torch.cat([self.orth_set[ln].to(device), U_new], dim=1)
-            # QR re-orthonormalization
-            Q, _ = torch.linalg.qr(U_concat, mode='reduced')
-            self.orth_set[ln] = Q.detach()
-
-    @staticmethod
-    def _compute_eps_prime(eps, r_bar):
-        # eps' = (r_bar - (1 - eps)) / r_bar, clipped to [eps, 0.999]
-        if r_bar <= 1e-8:
-            return min(0.999, max(eps, eps))
-        val = (r_bar - (1.0 - eps)) / r_bar
-        return float(max(eps, min(0.999, val)))
-
-    # ---------- CIL helpers ----------
-    @staticmethod
-    def _parse_cil_order(
-        order_str: str, group_str: str, num_classes: int, batch_size: int
-    ):
-        # groups: 'a,b; c,d' -> [[a,b],[c,d]]
-        if group_str:
-            groups = []
-            for grp in group_str.split(';'):
-                ids = [int(x.strip()) for x in grp.split(',') if x.strip() != '']
-                if ids:
-                    groups.append(ids)
-            return groups if groups else [[c] for c in range(num_classes)]
-        # linear order with optional batching
-        base = (
-            [int(x.strip()) for x in order_str.split(',') if x.strip() != '']
-            if order_str
-            else list(range(num_classes))
-        )
-        if batch_size <= 1:
-            return [[c] for c in base]
-        stages = []
-        for i in range(0, len(base), batch_size):
-            stages.append(base[i : i + batch_size])
-        return stages
-
-    def _cil_stage(self, round_idx: int) -> int:
-        if self.cil_rounds_per_class <= 0:
-            return -1
-        return min(len(self.cil_order) - 1, round_idx // self.cil_rounds_per_class)
-
-    # ---------- Evaluation overrides for CIL ----------
-    def evaluate(self, acc=None, loss=None):
-        if not getattr(self, 'cil_enable', False):
-            return super().evaluate(acc=acc, loss=loss)
-
-        import numpy as np
-
-        # Overall metrics (for continuity)
-        stats = super().test_metrics()
-        stats_train = super().train_metrics()
-        test_acc = sum(stats[2]) * 1.0 / sum(stats[1])
-        test_auc = sum(stats[3]) * 1.0 / sum(stats[1])
-        train_loss = sum(stats_train[2]) * 1.0 / sum(stats_train[1])
-
-        if acc is None:
-            self.rs_test_acc.append(test_acc)
-        else:
-            acc.append(test_acc)
-        if loss is None:
-            self.rs_train_loss.append(train_loss)
-        else:
-            loss.append(train_loss)
-
-        print("Averaged Train Loss: {:.4f}".format(train_loss))
-        print("Averaged Test Accuracy: {:.4f}".format(test_acc))
-        print("Averaged Test AUC: {:.4f}".format(test_auc))
-
-        # Per-class metrics for ACC/FGT
-        class_correct = {c: 0 for c in range(self.num_classes)}
-        class_total = {c: 0 for c in range(self.num_classes)}
-        with torch.no_grad():
-            for c in self.clients:
-                testloader = c.load_test_data()
-                model = c.model
-                model.eval()
-                for x, y in testloader:
-                    if type(x) == type([]):
-                        x = x[0]
-                    x = x.to(self.device)
-                    y = y.to(self.device)
-                    outputs = model(x)
-                    preds = torch.argmax(outputs, dim=1)
-                    for cls in y.unique().tolist():
-                        cls = int(cls)
-                        mask = y == cls
-                        class_total[cls] += int(mask.sum().item())
-                        class_correct[cls] += int((preds[mask] == y[mask]).sum().item())
-
-        # store per-stage accuracy per class
-        if not hasattr(self, 'cil_class_acc_hist'):
-            self.cil_class_acc_hist = {}
-        stage = getattr(self, 'active_max_class', -1)
-        if stage >= 0:
-            self.cil_class_acc_hist[stage] = {}
-            for cls in range(self.num_classes):
-                tot = class_total[cls]
-                acc_cls = (class_correct[cls] / tot) if tot > 0 else 0.0
-                self.cil_class_acc_hist[stage][cls] = acc_cls
-
-    def _compute_and_print_cil_metrics(self):
-        # ACC: mean per-class accuracy at final stage
-        if not hasattr(self, 'cil_class_acc_hist') or len(self.cil_class_acc_hist) == 0:
-            print('[CIL] No per-class history captured; skip ACC/FGT.')
-            return
-        final_stage = max(self.cil_class_acc_hist.keys())
-        final_accs = self.cil_class_acc_hist[final_stage]
-        valid_final = [final_accs.get(c, 0.0) for c in range(self.num_classes)]
-        ACC = float(np.mean(valid_final))
-
-        # FGT (per your definition): average over tasks of (acc at its own training stage - final-stage acc)
-        FGT_vals = []
-        # Build mapping stage -> classes trained at that stage
-        stage_to_classes = {}
-        if hasattr(self, 'cil_order') and isinstance(self.cil_order, list):
-            for stg, cls_group in enumerate(self.cil_order):
-                stage_to_classes[stg] = (
-                    cls_group if isinstance(cls_group, list) else [cls_group]
+                U_combined = torch.cat(
+                    [self.orth_set[layer_name].to(device), U_new], dim=1
                 )
+                Q, _ = torch.linalg.qr(U_combined, mode='reduced')
+                self.orth_set[layer_name] = Q.detach()
+
+    def _expand_client_basis(self, client_id, device):
+        """PFCL: Expand individual client's orthogonal basis"""
+        if client_id not in self.activation_dict:
+            return
+
+        if client_id not in self.client_orth_sets:
+            self.client_orth_sets[client_id] = {
+                name: None for name in self.orth_layer_names
+            }
+
+        client_activations = self.activation_dict[client_id]
+
+        for layer_name, (Y, r, b) in client_activations.items():
+            if layer_name not in self.orth_layer_names or Y is None or int(b) == 0:
+                continue
+
+            Y = Y.to(device)
+
+            # Compute adaptive threshold for this client
+            eps_prime = self._compute_adaptive_epsilon(self.epsilon, float(r))
+
+            # SVD and basis selection
+            try:
+                U_hat, S, _ = torch.linalg.svd(Y, full_matrices=False)
+            except RuntimeError:
+                U_hat, S, _ = torch.linalg.svd(Y.cpu(), full_matrices=False)
+                U_hat, S = U_hat.to(device), S.to(device)
+
+            # Select components by energy threshold
+            energy = S**2
+            cum_energy = torch.cumsum(energy, dim=0)
+            total_energy = energy.sum() + 1e-12
+            energy_ratio = cum_energy / total_energy
+
+            k = int((energy_ratio >= eps_prime).nonzero(as_tuple=True)[0][0].item()) + 1
+            U_new = U_hat[:, :k]
+
+            # Concatenate with existing client basis
+            if self.client_orth_sets[client_id][layer_name] is None:
+                self.client_orth_sets[client_id][layer_name] = U_new.detach()
+            else:
+                existing_basis = self.client_orth_sets[client_id][layer_name].to(device)
+                U_combined = torch.cat([existing_basis, U_new], dim=1)
+                Q, _ = torch.linalg.qr(U_combined, mode='reduced')
+                self.client_orth_sets[client_id][layer_name] = Q.detach()
+
+    def _compute_adaptive_epsilon(self, base_eps, residual_ratio):
+        """Compute adaptive epsilon based on residual ratio"""
+        if residual_ratio <= 1e-8:
+            return min(0.999, base_eps)
+        val = (residual_ratio - (1.0 - base_eps)) / residual_ratio
+        return float(max(base_eps, min(0.999, val)))
+
+    def _build_orth_layer_names(self, model: nn.Module):
+        """Get names of layers to apply orthogonal projection"""
+        names = []
+        for name, param in model.named_parameters():
+            # Only consider weight parameters (not biases)
+            if not name.endswith('weight'):
+                continue
+            # Skip batch norm layers
+            if any(k in name for k in ['bn', 'batchnorm', 'downsample.1']):
+                continue
+            # Only Conv2d and Linear layers (2D or 4D tensors)
+            if param.ndim in (2, 4):
+                names.append(name)
+        return names
+
+    def _parse_task_schedule(self, schedule_str):
+        """Parse task schedule from string"""
+        if not schedule_str:
+            return set()
+        try:
+            return set(int(x.strip()) for x in schedule_str.split(',') if x.strip())
+        except Exception:
+            return set()
+
+    def send_models(self):
+        """Send models and orthogonal bases to clients"""
+        super().send_models()
+
+        # Send orthogonal bases to clients for activation collection
+        for client in self.clients:
+            if self.pfcl_enable:
+                # Send client-specific basis
+                if client.id in self.client_orth_sets:
+                    client.orth_set_snapshot = copy.deepcopy(
+                        self.client_orth_sets[client.id]
+                    )
+                else:
+                    client.orth_set_snapshot = None
+            else:
+                # Send shared global basis
+                client.orth_set_snapshot = copy.deepcopy(self.orth_set)
+
+    def _is_task_boundary(self, current_round):
+        """Check if current round is a task boundary"""
+        # Check explicit task schedule
+        if current_round in self.task_schedule:
+            return True
+
+        # Check CIL-derived task boundaries
+        if self.cil_enable and self.cil_rounds_per_class > 0:
+            # Derive task boundaries from CIL schedule
+            num_stages = len(self.client_task_sequences.get(0, []))
+            cil_boundaries = [
+                (s + 1) * self.cil_rounds_per_class - 1 for s in range(num_stages)
+            ]
+            return current_round in cil_boundaries
+
+        return False
+
+    def evaluate(self, acc=None, loss=None):
+        """Evaluation method - delegates based on PFCL/CIL settings"""
+        if self.pfcl_enable:
+            return self.evaluate_pfcl()
         else:
-            for stg in self.cil_class_acc_hist.keys():
-                stage_to_classes[stg] = [stg]
-
-        for stg, cls_list in stage_to_classes.items():
-            accs_stg = self.cil_class_acc_hist.get(stg, {})
-            for cls in cls_list:
-                acc_at_stage = accs_stg.get(cls, 0.0)
-                acc_final = final_accs.get(cls, 0.0)
-                FGT_vals.append(acc_at_stage - acc_final)
-        FGT = float(np.mean(FGT_vals)) if len(FGT_vals) > 0 else 0.0
-
-        print(f"[CIL] Final ACC (mean per-class): {ACC:.4f}")
-        print(f"[CIL] Average Forgetting (FGT): {FGT:.4f}")
+            return super().evaluate(acc=acc, loss=loss)
