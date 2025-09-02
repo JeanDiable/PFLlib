@@ -1,0 +1,1 @@
+python main.py -data Cifar10 -m CNN -algo FedAvg -gr 6 -nc 2 -jr 1.0 -ls 1 -lr 0.01 -cil True -til True -pfcl True -client_seq "0:0,1|2,3;1:4,5|6,7" -cilrpc 3 -wandb True -wandb_project "pftl" -go "wandb_test" --wandb_project fed

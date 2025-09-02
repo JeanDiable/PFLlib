@@ -122,7 +122,18 @@ class Client(object):
                 y = y.to(self.device)
                 output = self.model(x)
 
-                test_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
+                # TIL: Apply task-aware evaluation if enabled
+                if getattr(self, 'til_enable', False) and hasattr(
+                    self, 'current_task_classes'
+                ):
+                    # Mask output to only current task classes
+                    masked_output = self._mask_output_for_evaluation(output)
+                    test_acc += (
+                        torch.sum(torch.argmax(masked_output, dim=1) == y)
+                    ).item()
+                else:
+                    test_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
+
                 test_num += y.shape[0]
 
                 y_prob.append(output.detach().cpu().numpy())
@@ -264,11 +275,39 @@ class Client(object):
                 if s >= 0 and s < len(stages):
                     allowed.update(stages[s])
 
+        # Count original data for suspicious filtering detection
+        original_class_counts = {}
+        for _, y in data_list:
+            y_int = int(y)
+            original_class_counts[y_int] = original_class_counts.get(y_int, 0) + 1
+
         class FilteredDataset(Dataset):
             def __init__(self, data, allowed):
                 self.samples = [(x, y) for (x, y) in data if int(y) in allowed]
                 if len(self.samples) == 0:
+                    print(
+                        f"[CIL WARNING] Client {self.id} filtered dataset is empty, using fallback"
+                    )
                     self.samples = data  # fallback to avoid empty loader
+
+                # Count filtered data for debugging
+                filtered_class_counts = {}
+                for _, y in self.samples:
+                    y_int = int(y)
+                    filtered_class_counts[y_int] = (
+                        filtered_class_counts.get(y_int, 0) + 1
+                    )
+
+                # Warn about suspicious filtering
+                if len(self.samples) < 10:
+                    print(
+                        f"[CIL WARNING] Client {self.id} has very few samples after filtering: {len(self.samples)}"
+                    )
+                    print(f"  - Mode: {'TRAIN' if is_train else 'TEST'}")
+                    print(f"  - Stage: {stage}, Allowed: {sorted(allowed)}")
+                    print(
+                        f"  - Filtered classes: {dict(sorted(filtered_class_counts.items()))}"
+                    )
 
             def __len__(self):
                 return len(self.samples)
@@ -320,6 +359,50 @@ class Client(object):
             if s >= 0 and s < len(stages):
                 allowed.update(stages[s])
         return allowed
+
+    # ---------- TIL (Task-Incremental Learning) methods ----------
+    def _mask_output_for_evaluation(self, output):
+        """Mask model output to only include current task's classes for TIL evaluation."""
+        if not hasattr(self, 'current_task_classes') or not self.current_task_classes:
+            return output
+
+        # Create a mask - set non-current-task outputs to very negative values
+        masked_output = output.clone()
+        task_classes = list(self.current_task_classes)
+
+        # Get all class indices
+        all_classes = set(range(output.size(1)))
+        non_task_classes = all_classes - set(task_classes)
+
+        # Mask non-task classes
+        for cls in non_task_classes:
+            masked_output[:, cls] = float('-inf')
+
+        return masked_output
+
+    def _mask_loss_for_training(self, output, target):
+        """Mask model output to only include current task's classes for TIL training loss."""
+        if not getattr(self, 'til_enable', False) or not hasattr(
+            self, 'current_task_classes'
+        ):
+            return self.loss(output, target)
+
+        if not self.current_task_classes:
+            return self.loss(output, target)
+
+        # Create a mask - set non-current-task outputs to zero
+        masked_output = output.clone()
+
+        task_classes = list(self.current_task_classes)
+
+        # Get all class indices
+        all_classes = set(range(output.size(1)))
+        non_task_classes = all_classes - set(task_classes)
+        # Mask non-task classes
+        for cls in non_task_classes:
+            masked_output[:, cls] = float('-inf')
+
+        return self.loss(masked_output, target)
 
     def get_current_task_classes(self):
         """

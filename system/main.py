@@ -40,6 +40,7 @@ from flcore.servers.servermoon import MOON
 from flcore.servers.servermtl import FedMTL
 from flcore.servers.serverntd import FedNTD
 from flcore.servers.serverpac import FedPAC
+from flcore.servers.serverpars import FedParS
 from flcore.servers.serverpcl import FedPCL
 from flcore.servers.serverper import FedPer
 from flcore.servers.serverperavg import PerAvg
@@ -253,6 +254,12 @@ def run(args):
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedFOT(args, i)
+
+        elif args.algorithm == "FedParS":
+            args.head = copy.deepcopy(args.model.fc)
+            args.model.fc = nn.Identity()
+            args.model = BaseHeadSplit(args.model, args.head)
+            server = FedParS(args, i)
 
         elif args.algorithm == "Local":
             server = Local(args, i)
@@ -675,6 +682,30 @@ if __name__ == "__main__":
         help="Multiplier for random projection width relative to layer dim in GPSE",
     )
 
+    # FedParS (Parallel Subspace with Gradient Guidance)
+    parser.add_argument(
+        '-psd',
+        "--parallel_space_dim",
+        type=int,
+        default=10,
+        help="Dimension of parallel subspace for FedParS",
+    )
+    parser.add_argument(
+        '-sth',
+        "--similarity_threshold",
+        type=float,
+        default=0.3,
+        help="Similarity threshold for finding parallel clients in FedParS",
+    )
+    parser.add_argument(
+        '-sig',
+        "--signature_method",
+        type=str,
+        default="covariance",
+        choices=["covariance", "mean"],
+        help="Method for computing task signatures in FedParS",
+    )
+
     # FedCross
     parser.add_argument('-fsb', "--first_stage_bound", type=int, default=0)
     parser.add_argument('-ca', "--fedcross_alpha", type=float, default=0.99)
@@ -733,6 +764,31 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Client-specific task sequences. Format: 'client_id:seq1,seq2;client_id2:seq1,seq2' or file path",
+    )
+
+    # Task-Incremental Learning (TIL)
+    parser.add_argument(
+        '-til',
+        "--til_enable",
+        type=bool,
+        default=False,
+        help="Enable Task-Incremental Learning: output masking for current task classes only",
+    )
+
+    # Wandb logging
+    parser.add_argument(
+        '-wandb',
+        "--wandb_enable",
+        type=bool,
+        default=False,
+        help="Enable wandb logging for experiment tracking",
+    )
+    parser.add_argument(
+        '-wandb_project',
+        "--wandb_project",
+        type=str,
+        default="federated-continual-learning",
+        help="Wandb project name",
     )
 
     args = parser.parse_args()

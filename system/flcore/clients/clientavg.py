@@ -25,6 +25,10 @@ class clientAVG(Client):
         if self.train_slow:
             max_local_epochs = np.random.randint(1, max_local_epochs // 2)
 
+        # Track training loss for wandb logging
+        total_loss = 0.0
+        total_samples = 0
+
         for epoch in range(max_local_epochs):
             for i, (x, y) in enumerate(trainloader):
                 if type(x) == type([]):
@@ -35,10 +39,23 @@ class clientAVG(Client):
                 if self.train_slow:
                     time.sleep(0.1 * np.abs(np.random.rand()))
                 output = self.model(x)
-                loss = self.loss(output, y)
+                # TIL: Use task-aware loss if enabled
+                if getattr(self, 'til_enable', False):
+                    loss = self._mask_loss_for_training(output, y)
+                else:
+                    loss = self.loss(output, y)
+                
+                # Track loss for logging
+                batch_size = y.size(0)
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
+                
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+
+        # Store average loss for server logging
+        self.last_train_loss = total_loss / total_samples if total_samples > 0 else 0.0
 
         # self.model.cpu()
 

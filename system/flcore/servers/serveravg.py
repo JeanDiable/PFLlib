@@ -52,9 +52,17 @@ class FedAvg(Server):
             self.selected_clients = self.select_clients()
             self.send_models()
 
+            # TIL: Set current task classes for clients
+            if self.til_enable:
+                for client in self.clients:
+                    self._set_client_current_task(client, i)
+
             if i % self.eval_gap == 0:
                 print(f"\n-------------Round number: {i}-------------")
-                if self.pfcl_enable:
+                if self.til_enable:
+                    print("\nEvaluate TIL tasks")
+                    self._evaluate_til_all_tasks(i)
+                elif self.pfcl_enable:
                     print("\nEvaluate personalized models")
                     self.evaluate_pfcl(i)
                 else:
@@ -73,6 +81,11 @@ class FedAvg(Server):
             if self.dlg_eval and i % self.dlg_gap == 0:
                 self.call_dlg(i)
             self.aggregate_parameters()
+            
+            # Log training losses to wandb
+            if hasattr(self, 'wandb_enable') and self.wandb_enable:
+                avg_train_loss = self._collect_training_losses()
+                self._log_training_metrics_to_wandb(i, avg_train_loss)
 
             self.Budget.append(time.time() - s_t)
             print('-' * 25, 'time cost', '-' * 25, self.Budget[-1])
@@ -93,9 +106,16 @@ class FedAvg(Server):
         if self.cil_enable:
             self.compute_cil_metrics()
 
+        # Compute final TIL metrics if enabled
+        if self.til_enable:
+            self._compute_til_final_metrics()
+
         self.save_results()
         if not self.pfcl_enable:  # Only save global model if not in personalized mode
             self.save_global_model()
+
+        # Finish wandb logging
+        self._finish_wandb()
 
         if self.num_new_clients > 0:
             self.eval_new_clients = True

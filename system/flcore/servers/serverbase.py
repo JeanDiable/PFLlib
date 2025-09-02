@@ -9,6 +9,14 @@ import torch
 from utils.data_utils import read_client_data
 from utils.dlg import DLG
 
+# Optional wandb import
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
+
 
 class Server(object):
     def __init__(self, args, times):
@@ -79,6 +87,24 @@ class Server(object):
         # CIL evaluation metrics
         self.cil_class_acc_hist = {}
         self.active_max_class = -1
+
+        # TIL (Task-Incremental Learning) support
+        self.til_enable = getattr(args, 'til_enable', False)
+        if self.til_enable:
+            print(f"[TIL] Task-Incremental Learning enabled")
+            # Track per-task performance for FGT calculation
+            self.task_performance_history = (
+                {}
+            )  # {client_id: {task_id: [accuracies_over_rounds]}}
+            self.til_metrics = {'acc': [], 'fgt': []}
+
+        # Wandb logging support
+        self.wandb_enable = getattr(args, 'wandb_enable', False)
+        self.wandb_run = None
+        if self.wandb_enable and WANDB_AVAILABLE:
+            self._init_wandb(args)
+        elif self.wandb_enable and not WANDB_AVAILABLE:
+            print("[WARNING] Wandb requested but not installed. pip install wandb")
 
         self.clients = []
         self.selected_clients = []
@@ -577,7 +603,8 @@ class Server(object):
             return -1
 
         stage = min(len(client_seq) - 1, current_round // self.cil_rounds_per_class)
-        return max(0, stage)
+        stage = max(0, stage)
+        return stage
 
     # Knowledge sharing is algorithm-specific and implemented in subclasses
 
@@ -588,16 +615,46 @@ class Server(object):
         if not self.pfcl_enable:
             return self.evaluate()
 
+        if current_round is not None and current_round % 10 == 0:
+            print(f"\n[PFCL DEBUG] Starting evaluation at round {current_round}")
+
         client_metrics = {}
         overall_correct = 0
         overall_samples = 0
         overall_auc = 0
 
         for client in self.clients:
+            # Debug: Print client's current state (only every 10 rounds or if suspicious)
+            client_stage = self._get_client_stage(client.id, current_round)
+            client_seq = self.client_task_sequences.get(client.id, [])
+
             # Test client's personal model
             ct, ns, auc = client.test_metrics()
+            accuracy = ct / ns if ns > 0 else 0.0
+
+            # Warn about suspicious accuracies
+            if accuracy > 0.95 or accuracy < 0.05:
+                print(
+                    f"[PFCL WARNING] Client {client.id} suspicious accuracy: {accuracy:.4f}"
+                )
+                print(f"  - Stage: {client_stage}, Sequence: {client_seq}")
+                print(f"  - Test samples: {ns}, Correct: {ct}")
+                if client_stage >= 0 and client_stage < len(client_seq):
+                    current_task_classes = client_seq[client_stage]
+                    cumulative_classes = []
+                    for s in range(client_stage + 1):
+                        if s < len(client_seq):
+                            cumulative_classes.extend(client_seq[s])
+                    print(
+                        f"  - Current task: {current_task_classes}, Cumulative: {sorted(cumulative_classes)}"
+                    )
+
+            # Brief debug info every 10 rounds
+            elif current_round is not None and current_round % 10 == 0:
+                print(f"[PFCL DEBUG] Client {client.id}: {accuracy:.3f} ({ct}/{ns})")
+
             client_metrics[client.id] = {
-                'accuracy': ct / ns if ns > 0 else 0.0,
+                'accuracy': accuracy,
                 'samples': ns,
                 'auc': auc,
             }
@@ -608,6 +665,11 @@ class Server(object):
         # Overall metrics across all clients
         overall_acc = overall_correct / overall_samples if overall_samples > 0 else 0.0
         overall_auc = overall_auc / overall_samples if overall_samples > 0 else 0.0
+
+        print(f"\n[PFCL DEBUG] Overall totals:")
+        print(f"  - Total correct: {overall_correct}")
+        print(f"  - Total samples: {overall_samples}")
+        print(f"  - Overall accuracy: {overall_acc:.4f}")
 
         # Store metrics
         self.rs_test_acc.append(overall_acc)
@@ -786,5 +848,317 @@ class Server(object):
 
             FGT = float(np.mean(FGT_vals)) if FGT_vals else 0.0
 
-            print(f"[CIL] Final ACC (mean per-class): {ACC:.4f}")
-            print(f"[CIL] Average Forgetting (FGT): {FGT:.4f}")
+        print(f"[CIL] Final ACC (mean per-class): {ACC:.4f}")
+        print(f"[CIL] Average Forgetting (FGT): {FGT:.4f}")
+
+    # ---------- TIL (Task-Incremental Learning) methods ----------
+    def _set_client_current_task(self, client, current_round):
+        """Set the current task classes for a client based on round and TIL settings."""
+        if not self.til_enable:
+            return
+
+        # Set TIL enable flag
+        client.til_enable = True
+
+        # Get client's task sequence
+        client_task_sequence = self.client_task_sequences.get(client.id, [])
+        if not client_task_sequence:
+            client.current_task_classes = set(range(self.num_classes))
+            return
+
+        # Determine current task based on round
+        if self.cil_rounds_per_class > 0:
+            current_task_idx = current_round // self.cil_rounds_per_class
+        else:
+            current_task_idx = 0
+
+        if current_task_idx < len(client_task_sequence):
+            client.current_task_classes = set(client_task_sequence[current_task_idx])
+        else:
+            # If beyond available tasks, use last task
+            client.current_task_classes = (
+                set(client_task_sequence[-1]) if client_task_sequence else set()
+            )
+
+        print(
+            f"[TIL] Client {client.id} Round {current_round}: Task {current_task_idx}, Classes {list(client.current_task_classes)}"
+        )
+
+    def _evaluate_til_all_tasks(self, current_round):
+        """Evaluate all clients on all their seen tasks for TIL."""
+        if not self.til_enable:
+            return
+
+        print(f"[TIL] Evaluating all tasks at round {current_round}")
+
+        for client in self.clients:
+            client_id = client.id
+            client_task_sequence = self.client_task_sequences.get(client_id, [])
+
+            if client_id not in self.task_performance_history:
+                self.task_performance_history[client_id] = {}
+
+            # Determine how many tasks this client has seen
+            if self.cil_rounds_per_class > 0:
+                max_seen_task = min(
+                    current_round // self.cil_rounds_per_class + 1,
+                    len(client_task_sequence),
+                )
+            else:
+                max_seen_task = len(client_task_sequence)
+
+            # Evaluate each seen task
+            for task_id in range(max_seen_task):
+                if task_id < len(client_task_sequence):
+                    task_classes = client_task_sequence[task_id]
+
+                    # Set client to evaluate this specific task
+                    client.current_task_classes = set(task_classes)
+
+                    # Get task-specific accuracy
+                    test_acc, test_num, _ = client.test_metrics()
+                    task_accuracy = test_acc / test_num if test_num > 0 else 0.0
+
+                    # Store performance
+                    if task_id not in self.task_performance_history[client_id]:
+                        self.task_performance_history[client_id][task_id] = []
+                    self.task_performance_history[client_id][task_id].append(
+                        task_accuracy
+                    )
+
+                    print(
+                        f"[TIL] Client {client_id} Task {task_id} (Classes {task_classes}): {task_accuracy:.4f}"
+                    )
+
+        # Store overall accuracy for compatibility and prepare wandb logging
+        client_task_metrics = {}
+        if self.task_performance_history:
+            overall_acc = 0.0
+            total_tasks = 0
+            
+            for client_id, task_history in self.task_performance_history.items():
+                client_task_metrics[client_id] = {}
+                for task_id, accuracies in task_history.items():
+                    if accuracies:
+                        current_acc = accuracies[-1]
+                        overall_acc += current_acc
+                        total_tasks += 1
+                        client_task_metrics[client_id][task_id] = current_acc
+                        
+            overall_acc = overall_acc / total_tasks if total_tasks > 0 else 0.0
+            self.rs_test_acc.append(overall_acc)
+            
+            # Log to wandb
+            self._log_til_task_metrics_to_wandb(current_round, client_task_metrics)
+            self._log_evaluation_metrics_to_wandb(current_round, overall_acc)
+
+    def _compute_til_final_metrics(self):
+        """Compute final ACC and FGT metrics for TIL."""
+        if not self.til_enable or not self.task_performance_history:
+            return {'ACC': 0.0, 'FGT': 0.0}
+
+        client_accs = []
+        client_fgts = []
+
+        for client_id, task_history in self.task_performance_history.items():
+            client_task_accs = []
+            client_task_fgts = []
+
+            # Get client's task sequence to determine task end points
+            client_task_sequence = self.client_task_sequences.get(client_id, [])
+            
+            for task_id, accuracies in task_history.items():
+                if accuracies:
+                    final_acc = accuracies[-1]  # Final accuracy (at end of training)
+                    
+                    # Calculate forgetting: accuracy at end of task training vs final accuracy
+                    if self.cil_rounds_per_class > 0 and task_id < len(client_task_sequence):
+                        # Find the accuracy at the end of this task's training period
+                        task_end_round = (task_id + 1) * self.cil_rounds_per_class - 1
+                        # Find the closest recorded round to task end
+                        task_end_acc = final_acc  # Default to final if not found
+                        
+                        # Look for accuracy recorded at or just after task end
+                        for round_idx, acc in enumerate(accuracies):
+                            # Round index corresponds to evaluation rounds
+                            eval_round = round_idx * self.eval_gap if hasattr(self, 'eval_gap') and self.eval_gap > 0 else round_idx
+                            if eval_round >= task_end_round:
+                                task_end_acc = acc
+                                break
+                        
+                        forgetting = task_end_acc - final_acc  # Positive = forgetting, Negative = improvement
+                    else:
+                        # Fallback: no forgetting for last task or if rounds per class not set
+                        forgetting = 0.0
+
+                    client_task_accs.append(final_acc)
+                    client_task_fgts.append(forgetting)
+
+                    print(
+                        f"[TIL] Client {client_id} Task {task_id}: Final {final_acc:.4f}, Task-End {task_end_acc:.4f}, FGT {forgetting:.4f}"
+                    )
+
+            if client_task_accs:
+                client_accs.append(np.mean(client_task_accs))
+                client_fgts.append(np.mean(client_task_fgts))
+
+        final_acc = np.mean(client_accs) if client_accs else 0.0
+        final_fgt = np.mean(client_fgts) if client_fgts else 0.0
+
+        print(f"[TIL] Final ACC: {final_acc:.4f}")
+        print(f"[TIL] Final FGT: {final_fgt:.4f}")
+
+        # Log final metrics to wandb
+        if self.wandb_enable and self.wandb_run:
+            self._log_til_final_metrics_to_wandb(final_acc, final_fgt, client_accs, client_fgts)
+
+        return {'ACC': final_acc, 'FGT': final_fgt}
+
+    # ---------- Wandb logging methods ----------
+    def _init_wandb(self, args):
+        """Initialize wandb logging."""
+        try:
+            config = {
+                'algorithm': args.algorithm,
+                'dataset': args.dataset,
+                'model': args.model,
+                'global_rounds': args.global_rounds,
+                'num_clients': args.num_clients,
+                'join_ratio': args.join_ratio,
+                'local_epochs': args.local_epochs,
+                'local_learning_rate': args.local_learning_rate,
+                'batch_size': args.batch_size,
+                'cil_enable': getattr(args, 'cil_enable', False),
+                'til_enable': getattr(args, 'til_enable', False),
+                'pfcl_enable': getattr(args, 'pfcl_enable', False),
+                'cil_rounds_per_class': getattr(args, 'cil_rounds_per_class', 0),
+                'num_classes': args.num_classes,
+            }
+            
+            # Add task sequence info
+            if hasattr(self, 'client_task_sequences') and self.client_task_sequences:
+                config['num_clients_with_sequences'] = len(self.client_task_sequences)
+                config['avg_tasks_per_client'] = np.mean([len(seq) for seq in self.client_task_sequences.values()])
+            
+            project_name = getattr(args, 'wandb_project', 'federated-continual-learning')
+            
+            self.wandb_run = wandb.init(
+                project=project_name,
+                name=f"{args.algorithm}_{args.dataset}_{args.goal}",
+                config=config,
+                reinit=True
+            )
+            
+            print(f"[WANDB] Initialized logging to project: {project_name}")
+            
+        except Exception as e:
+            print(f"[WANDB ERROR] Failed to initialize: {e}")
+            self.wandb_enable = False
+
+    def _log_training_metrics_to_wandb(self, round_num, train_loss=None):
+        """Log training metrics to wandb."""
+        if not self.wandb_enable or not self.wandb_run:
+            return
+            
+        metrics = {'round': round_num}
+        if train_loss is not None:
+            metrics['train/loss'] = train_loss
+            
+        try:
+            wandb.log(metrics)
+        except Exception as e:
+            print(f"[WANDB ERROR] Failed to log training metrics: {e}")
+
+    def _log_evaluation_metrics_to_wandb(self, round_num, accuracy=None, auc=None):
+        """Log evaluation metrics to wandb."""
+        if not self.wandb_enable or not self.wandb_run:
+            return
+            
+        metrics = {'round': round_num}
+        if accuracy is not None:
+            metrics['eval/accuracy'] = accuracy
+        if auc is not None:
+            metrics['eval/auc'] = auc
+            
+        try:
+            wandb.log(metrics)
+        except Exception as e:
+            print(f"[WANDB ERROR] Failed to log evaluation metrics: {e}")
+
+    def _log_til_task_metrics_to_wandb(self, round_num, client_task_metrics):
+        """Log per-client per-task metrics to wandb for TIL."""
+        if not self.wandb_enable or not self.wandb_run:
+            return
+            
+        try:
+            metrics = {'round': round_num}
+            
+            # Log individual client-task accuracies
+            for client_id, task_metrics in client_task_metrics.items():
+                for task_id, accuracy in task_metrics.items():
+                    metrics[f'til/client_{client_id}_task_{task_id}'] = accuracy
+                    
+            # Log average metrics
+            all_accuracies = [acc for task_metrics in client_task_metrics.values() 
+                            for acc in task_metrics.values()]
+            if all_accuracies:
+                metrics['til/avg_task_accuracy'] = np.mean(all_accuracies)
+                metrics['til/num_active_tasks'] = len(all_accuracies)
+                
+            wandb.log(metrics)
+        except Exception as e:
+            print(f"[WANDB ERROR] Failed to log TIL task metrics: {e}")
+
+    def _log_til_final_metrics_to_wandb(self, final_acc, final_fgt, client_accs, client_fgts):
+        """Log final TIL metrics to wandb."""
+        if not self.wandb_enable or not self.wandb_run:
+            return
+            
+        try:
+            metrics = {
+                'final/til_acc': final_acc,
+                'final/til_fgt': final_fgt,
+            }
+            
+            # Log per-client metrics
+            for i, (acc, fgt) in enumerate(zip(client_accs, client_fgts)):
+                metrics[f'final/client_{i}_acc'] = acc
+                metrics[f'final/client_{i}_fgt'] = fgt
+                
+            # Log distribution statistics
+            if client_accs:
+                metrics['final/acc_std'] = np.std(client_accs)
+                metrics['final/acc_min'] = np.min(client_accs)
+                metrics['final/acc_max'] = np.max(client_accs)
+                
+            if client_fgts:
+                metrics['final/fgt_std'] = np.std(client_fgts)
+                metrics['final/fgt_min'] = np.min(client_fgts)
+                metrics['final/fgt_max'] = np.max(client_fgts)
+                
+            wandb.log(metrics)
+            print(f"[WANDB] Logged final TIL metrics: ACC={final_acc:.4f}, FGT={final_fgt:.4f}")
+            
+        except Exception as e:
+            print(f"[WANDB ERROR] Failed to log final TIL metrics: {e}")
+
+    def _collect_training_losses(self):
+        """Collect training losses from selected clients for logging."""
+        if not hasattr(self, 'selected_clients') or not self.selected_clients:
+            return None
+            
+        losses = []
+        for client in self.selected_clients:
+            if hasattr(client, 'last_train_loss'):
+                losses.append(client.last_train_loss)
+                
+        return np.mean(losses) if losses else None
+
+    def _finish_wandb(self):
+        """Finish wandb run."""
+        if self.wandb_enable and self.wandb_run:
+            try:
+                wandb.finish()
+                print("[WANDB] Finished logging")
+            except Exception as e:
+                print(f"[WANDB ERROR] Failed to finish: {e}")
