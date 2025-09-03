@@ -1,0 +1,4 @@
+---
+alwaysApply: true
+---
+Make sure your testing is in the 'pfllib' conda environment.

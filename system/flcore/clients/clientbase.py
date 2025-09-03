@@ -136,7 +136,14 @@ class Client(object):
 
                 test_num += y.shape[0]
 
-                y_prob.append(output.detach().cpu().numpy())
+                # Handle potential -inf values from TIL masking
+                output_for_prob = output.detach().cpu().numpy()
+                # Replace -inf with very small values to avoid NaN in AUC computation
+                output_for_prob = np.where(
+                    np.isinf(output_for_prob), -1e10, output_for_prob
+                )
+                y_prob.append(output_for_prob)
+
                 nc = self.num_classes
                 if self.num_classes == 2:
                     nc += 1
@@ -151,7 +158,14 @@ class Client(object):
         y_prob = np.concatenate(y_prob, axis=0)
         y_true = np.concatenate(y_true, axis=0)
 
-        auc = metrics.roc_auc_score(y_true, y_prob, average='micro')
+        # Handle potential NaN/inf in AUC computation
+        try:
+            # Additional safety: replace any remaining NaN/inf values
+            y_prob = np.nan_to_num(y_prob, nan=0.0, posinf=1e10, neginf=-1e10)
+            auc = metrics.roc_auc_score(y_true, y_prob, average='micro')
+        except Exception as e:
+            print(f"[WARNING] AUC computation failed: {e}, setting AUC=0.0")
+            auc = 0.0
 
         return test_acc, test_num, auc
 
@@ -252,10 +266,14 @@ class Client(object):
                     ]
 
         # Determine current stage
-        stage = getattr(self, 'cil_stage', None)
-        if stage is None:
-            # Estimate based on local round counter
-            stage = int(self.train_time_cost['num_rounds'] // self.cil_rounds_per_class)
+        # For PFTIL (TIL + personalized sequences), use current_task_idx instead of cil_stage
+        if hasattr(self, 'current_task_idx') and self.current_task_idx is not None:
+            stage = self.current_task_idx
+        else:
+            stage = getattr(self, 'cil_stage', None)
+            if stage is None:
+                # Estimate based on local round counter
+                stage = int(self.train_time_cost['num_rounds'] // self.cil_rounds_per_class)
 
         # allowed classes
         if is_train:
@@ -281,12 +299,14 @@ class Client(object):
             y_int = int(y)
             original_class_counts[y_int] = original_class_counts.get(y_int, 0) + 1
 
+        client_id = self.id  # Capture client ID for use in nested class
+
         class FilteredDataset(Dataset):
             def __init__(self, data, allowed):
                 self.samples = [(x, y) for (x, y) in data if int(y) in allowed]
                 if len(self.samples) == 0:
                     print(
-                        f"[CIL WARNING] Client {self.id} filtered dataset is empty, using fallback"
+                        f"[CIL WARNING] Client {client_id} filtered dataset is empty, using fallback"
                     )
                     self.samples = data  # fallback to avoid empty loader
 
@@ -301,7 +321,7 @@ class Client(object):
                 # Warn about suspicious filtering
                 if len(self.samples) < 10:
                     print(
-                        f"[CIL WARNING] Client {self.id} has very few samples after filtering: {len(self.samples)}"
+                        f"[CIL WARNING] Client {client_id} has very few samples after filtering: {len(self.samples)}"
                     )
                     print(f"  - Mode: {'TRAIN' if is_train else 'TEST'}")
                     print(f"  - Stage: {stage}, Allowed: {sorted(allowed)}")

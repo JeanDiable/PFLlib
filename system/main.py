@@ -12,6 +12,7 @@ import torchvision
 from flcore.servers.serverala import FedALA
 from flcore.servers.serveramp import FedAMP
 from flcore.servers.serverapfl import APFL
+from flcore.servers.serverapop import APOP
 from flcore.servers.serverapple import APPLE
 from flcore.servers.serveras import FedAS
 from flcore.servers.serveravg import FedAvg
@@ -437,6 +438,12 @@ def run(args):
         elif args.algorithm == "FedCross":
             server = FedCross(args, i)
 
+        elif args.algorithm == "APOP":
+            args.head = copy.deepcopy(args.model.fc)
+            args.model.fc = nn.Identity()
+            args.model = BaseHeadSplit(args.model, args.head)
+            server = APOP(args, i)
+
         else:
             raise NotImplementedError
 
@@ -789,6 +796,36 @@ if __name__ == "__main__":
         type=str,
         default="federated-continual-learning",
         help="Wandb project name",
+    )
+
+    # APOP (Asynchronous Parallel-Orthogonal Projection) parameters
+    parser.add_argument(
+        '-subspace_dim',
+        "--subspace_dim",
+        type=int,
+        default=20,
+        help="Dimension of knowledge subspaces for APOP (r in algorithm)",
+    )
+    parser.add_argument(
+        '-adaptation_threshold',
+        "--adaptation_threshold",
+        type=float,
+        default=0.3,
+        help="Similarity threshold for adaptation period in APOP (δ in algorithm)",
+    )
+    parser.add_argument(
+        '-fusion_threshold',
+        "--fusion_threshold",
+        type=float,
+        default=0.7,
+        help="Similarity threshold for knowledge fusion in APOP (γ in algorithm)",
+    )
+    parser.add_argument(
+        '-max_transfer_gain',
+        "--max_transfer_gain",
+        type=float,
+        default=2.0,
+        help="Maximum transfer gain for parallel projection in APOP (α_max in algorithm)",
     )
 
     args = parser.parse_args()
