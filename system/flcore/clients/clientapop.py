@@ -44,8 +44,12 @@ class clientAPOP(Client):
         # DEBUG: Check if client is receiving any training data
         if len(trainloader.dataset) == 0:
             print(f"[APOP] ERROR: Client {self.id} has EMPTY training dataset!")
-            print(f"[APOP] Client {self.id} current_task_classes: {getattr(self, 'current_task_classes', 'None')}")
-            print(f"[APOP] Client {self.id} current_task_idx: {getattr(self, 'current_task_idx', 'None')}")
+            print(
+                f"[APOP] Client {self.id} current_task_classes: {getattr(self, 'current_task_classes', 'None')}"
+            )
+            print(
+                f"[APOP] Client {self.id} current_task_idx: {getattr(self, 'current_task_idx', 'None')}"
+            )
             return
         else:
             # Sample a few data points to check classes
@@ -54,9 +58,15 @@ class clientAPOP(Client):
                 if i >= 3:  # Check first 3 batches
                     break
                 sample_classes.update(y.cpu().numpy().tolist())
-            print(f"[APOP] DEBUG: Client {self.id} training data contains classes: {sorted(sample_classes)}")
-            print(f"[APOP] DEBUG: Client {self.id} assigned task classes: {getattr(self, 'current_task_classes', 'None')}")
-            print(f"[APOP] DEBUG: Client {self.id} dataset size: {len(trainloader.dataset)}")
+            print(
+                f"[APOP] DEBUG: Client {self.id} training data contains classes: {sorted(sample_classes)}"
+            )
+            print(
+                f"[APOP] DEBUG: Client {self.id} assigned task classes: {getattr(self, 'current_task_classes', 'None')}"
+            )
+            print(
+                f"[APOP] DEBUG: Client {self.id} dataset size: {len(trainloader.dataset)}"
+            )
 
         start_time = time.time()
         max_local_epochs = self.local_epochs
@@ -75,11 +85,15 @@ class clientAPOP(Client):
         # Ensure past bases are set correctly for clients on subsequent tasks
         if hasattr(self, 'current_task_idx') and self.current_task_idx > 0:
             if not hasattr(self, 'past_bases') or self.past_bases is None:
-                print(f"[APOP] WARNING: Client {self.id} on task {self.current_task_idx} but no past_bases! This may cause adaptation issues.")
-                self._log_to_wandb({
-                    'training/missing_past_bases_warning': 1,
-                    'training/current_task_idx': self.current_task_idx
-                })
+                print(
+                    f"[APOP] WARNING: Client {self.id} on task {self.current_task_idx} but no past_bases! This may cause adaptation issues."
+                )
+                self._log_to_wandb(
+                    {
+                        'training/missing_past_bases_warning': 1,
+                        'training/current_task_idx': self.current_task_idx,
+                    }
+                )
 
         for epoch in range(max_local_epochs):
             for i, (x, y) in enumerate(trainloader):
@@ -112,9 +126,11 @@ class clientAPOP(Client):
                 # APOP: Apply dual subspace gradient modulation only for subsequent tasks
                 # First task should be completely free training
                 current_task_idx = getattr(self, 'current_task_idx', 0)
-                if current_task_idx > 0 or (hasattr(self, 'past_bases') and self.past_bases is not None):
+                if current_task_idx > 0 or (
+                    hasattr(self, 'past_bases') and self.past_bases is not None
+                ):
                     self._apply_apop_gradient_modulation()
-                    
+
                     # Check adaptation status during training only for subsequent tasks
                     if not self.is_adapted:
                         self._check_adaptation_status(trainloader)
@@ -185,9 +201,11 @@ class clientAPOP(Client):
             # Method 1: Use only final layer gradients (much smaller dimension)
             final_layer_grads = []
             for name, param in self.model.named_parameters():
-                if param.grad is not None and ('head' in name or 'classifier' in name or 'fc' in name):
+                if param.grad is not None and (
+                    'head' in name or 'classifier' in name or 'fc' in name
+                ):
                     final_layer_grads.append(param.grad.view(-1))
-            
+
             if final_layer_grads:
                 signature = torch.cat(final_layer_grads).detach().cpu().numpy()
             else:
@@ -196,11 +214,12 @@ class clientAPOP(Client):
                 for param in self.model.parameters():
                     if param.grad is not None:
                         gradients.append(param.grad.view(-1))
-                
+
                 if gradients:
                     full_signature = torch.cat(gradients).detach().cpu().numpy()
                     # Use SVD for dimensionality reduction to 512 dimensions
                     from sklearn.decomposition import TruncatedSVD
+
                     if len(full_signature) > 512:
                         # Reshape for SVD and reduce to 512 dimensions
                         full_signature = full_signature.reshape(1, -1)
@@ -214,21 +233,25 @@ class clientAPOP(Client):
 
             # Method 3: Additional statistical features for robustness
             # Add statistical features of the signature
-            stats = np.array([
-                np.mean(signature),
-                np.std(signature),
-                np.max(signature),
-                np.min(signature),
-                np.median(signature),
-                np.percentile(signature, 25),
-                np.percentile(signature, 75)
-            ])
-            
+            stats = np.array(
+                [
+                    np.mean(signature),
+                    np.std(signature),
+                    np.max(signature),
+                    np.min(signature),
+                    np.median(signature),
+                    np.percentile(signature, 25),
+                    np.percentile(signature, 75),
+                ]
+            )
+
             # Combine original signature with statistical features
             enhanced_signature = np.concatenate([signature, stats])
-            
+
             # Normalize final signature
-            enhanced_signature = enhanced_signature / (np.linalg.norm(enhanced_signature) + 1e-8)
+            enhanced_signature = enhanced_signature / (
+                np.linalg.norm(enhanced_signature) + 1e-8
+            )
             return enhanced_signature
 
         except Exception as e:
@@ -246,7 +269,7 @@ class clientAPOP(Client):
         for param in self.model.parameters():
             if param.grad is not None:
                 gradients.append(param.grad.view(-1))
-        
+
         if gradients:
             g = torch.cat(gradients)
             return torch.norm(g).item()
@@ -257,8 +280,11 @@ class clientAPOP(Client):
         try:
             if hasattr(self, 'wandb_enable') and self.wandb_enable:
                 import wandb
+
                 # Prefix all metrics with client ID
-                prefixed_metrics = {f"client_{self.id}/{k}": v for k, v in metrics_dict.items()}
+                prefixed_metrics = {
+                    f"client_{self.id}/{k}": v for k, v in metrics_dict.items()
+                }
                 wandb.log(prefixed_metrics)
         except Exception:
             pass  # Fail silently if wandb not available
@@ -271,51 +297,68 @@ class clientAPOP(Client):
             self._gradient_mod_count += 1
         else:
             self._gradient_mod_count = 1
-        
+
         # Get original gradient norm for monitoring
         original_grad_norm = self._get_gradient_norm()
-        
+
         # Check for gradient explosion and apply clipping if needed
         if original_grad_norm > 1e10:
-            print(f"[APOP] WARNING: Client {self.id} gradient explosion! Norm: {original_grad_norm:.2e} - Applying gradient clipping")
+            print(
+                f"[APOP] WARNING: Client {self.id} gradient explosion! Norm: {original_grad_norm:.2e} - Applying gradient clipping"
+            )
             # Apply gradient clipping
             for param in self.model.parameters():
                 if param.grad is not None:
                     param.grad.data.clamp_(-1e6, 1e6)  # Clip to reasonable range
-        
+
         # Step 1: Orthogonal projection to prevent forgetting
         if self.past_bases is not None:
             self._apply_orthogonal_projection()
-        
+
         # Step 2: Parallel projection for knowledge transfer (if adapted)
         if self.is_adapted and self.parallel_basis is not None:
             self._apply_parallel_projection()
-        
+
         # Log important status changes or periodically
         should_log = (
-            self._gradient_mod_count % 100 == 1 or  # Every 100 steps
-            original_grad_norm > 1e8 or  # Gradient issues
-            (hasattr(self, '_last_logged_state') and 
-             self._last_logged_state != (self.past_bases is not None, self.is_adapted, self.parallel_basis is not None))  # State changes
+            self._gradient_mod_count % 100 == 1  # Every 100 steps
+            or original_grad_norm > 1e8  # Gradient issues
+            or (
+                hasattr(self, '_last_logged_state')
+                and self._last_logged_state
+                != (
+                    self.past_bases is not None,
+                    self.is_adapted,
+                    self.parallel_basis is not None,
+                )
+            )  # State changes
         )
-        
+
         if should_log:
             final_grad_norm = self._get_gradient_norm()
             status = f"Past:{self.past_bases is not None}, Adapted:{self.is_adapted}, Transfer:{self.parallel_basis is not None}"
-            print(f"[APOP] C{self.id} T{self.current_task_idx} S{self._gradient_mod_count}: {status} | Grad: {original_grad_norm:.2e}→{final_grad_norm:.2e}")
-            
-            self._last_logged_state = (self.past_bases is not None, self.is_adapted, self.parallel_basis is not None)
-            
+            print(
+                f"[APOP] C{self.id} T{self.current_task_idx} S{self._gradient_mod_count}: {status} | Grad: {original_grad_norm:.2e}→{final_grad_norm:.2e}"
+            )
+
+            self._last_logged_state = (
+                self.past_bases is not None,
+                self.is_adapted,
+                self.parallel_basis is not None,
+            )
+
             # Log to wandb if available
-            self._log_to_wandb({
-                'gradient_norm_original': original_grad_norm,
-                'gradient_norm_final': final_grad_norm,
-                'has_past_bases': self.past_bases is not None,
-                'is_adapted': self.is_adapted,
-                'has_parallel_basis': self.parallel_basis is not None,
-                'current_task': self.current_task_idx,
-                'modulation_step': self._gradient_mod_count
-            })
+            self._log_to_wandb(
+                {
+                    'gradient_norm_original': original_grad_norm,
+                    'gradient_norm_final': final_grad_norm,
+                    'has_past_bases': self.past_bases is not None,
+                    'is_adapted': self.is_adapted,
+                    'has_parallel_basis': self.parallel_basis is not None,
+                    'current_task': self.current_task_idx,
+                    'modulation_step': self._gradient_mod_count,
+                }
+            )
 
     def _apply_orthogonal_projection(self):
         """Project gradients orthogonal to past task subspace to prevent forgetting.
@@ -354,18 +397,20 @@ class clientAPOP(Client):
             BT_g = torch.matmul(B_past.t(), g_k.unsqueeze(-1)).squeeze(-1)
             projection = torch.matmul(B_past, BT_g.unsqueeze(-1)).squeeze(-1)
             g_k_prime = g_k - projection
-            
+
             # Log projection effectiveness to wandb
             projection_norm = torch.norm(projection).item()
             final_grad_norm = torch.norm(g_k_prime).item()
             if original_grad_norm > 0:
                 forgetting_prevention_ratio = projection_norm / original_grad_norm
-                self._log_to_wandb({
-                    'orthogonal_projection/original_norm': original_grad_norm,
-                    'orthogonal_projection/projection_norm': projection_norm,
-                    'orthogonal_projection/final_norm': final_grad_norm,
-                    'orthogonal_projection/prevention_ratio': forgetting_prevention_ratio
-                })
+                self._log_to_wandb(
+                    {
+                        'orthogonal_projection/original_norm': original_grad_norm,
+                        'orthogonal_projection/projection_norm': projection_norm,
+                        'orthogonal_projection/final_norm': final_grad_norm,
+                        'orthogonal_projection/prevention_ratio': forgetting_prevention_ratio,
+                    }
+                )
 
             # Redistribute modulated gradients back to parameters
             start_idx = 0
@@ -424,28 +469,30 @@ class clientAPOP(Client):
             # Parallel projection: g_k^∥ = B_∥ B_∥^T g_k'
             BT_g = torch.matmul(B_parallel.t(), g_k_prime.unsqueeze(-1)).squeeze(-1)
             g_k_parallel = torch.matmul(B_parallel, BT_g.unsqueeze(-1)).squeeze(-1)
-            
+
             # Orthogonal component: g_k^⊥ = g_k' - g_k^∥
             g_k_orthogonal = g_k_prime - g_k_parallel
 
             # Final modulated gradient: g_k'' = (1+α) g_k^∥ + g_k^⊥
             g_k_final = (1 + alpha) * g_k_parallel + g_k_orthogonal
             final_grad_norm = torch.norm(g_k_final).item()
-            
+
             # Log transfer effectiveness to wandb
             parallel_norm = torch.norm(g_k_parallel).item()
             orthogonal_norm = torch.norm(g_k_orthogonal).item()
             if input_grad_norm > 0:
                 transfer_boost = final_grad_norm / input_grad_norm
-                self._log_to_wandb({
-                    'parallel_projection/input_norm': input_grad_norm,
-                    'parallel_projection/parallel_norm': parallel_norm,
-                    'parallel_projection/orthogonal_norm': orthogonal_norm,
-                    'parallel_projection/final_norm': final_grad_norm,
-                    'parallel_projection/transfer_gain': alpha,
-                    'parallel_projection/similarity_retrieved': self.similarity_retrieved,
-                    'parallel_projection/transfer_boost': transfer_boost
-                })
+                self._log_to_wandb(
+                    {
+                        'parallel_projection/input_norm': input_grad_norm,
+                        'parallel_projection/parallel_norm': parallel_norm,
+                        'parallel_projection/orthogonal_norm': orthogonal_norm,
+                        'parallel_projection/final_norm': final_grad_norm,
+                        'parallel_projection/transfer_gain': alpha,
+                        'parallel_projection/similarity_retrieved': self.similarity_retrieved,
+                        'parallel_projection/transfer_boost': transfer_boost,
+                    }
+                )
 
             # Redistribute modulated gradients back to parameters
             start_idx = 0
@@ -458,9 +505,7 @@ class clientAPOP(Client):
                     start_idx += num_elements
 
         except Exception as e:
-            print(
-                f"[APOP] ERROR: Parallel projection failed for client {self.id}: {e}"
-            )
+            print(f"[APOP] ERROR: Parallel projection failed for client {self.id}: {e}")
 
     def _check_adaptation_status(self, trainloader):
         """Check if client has adapted enough to request knowledge transfer."""
@@ -470,12 +515,14 @@ class clientAPOP(Client):
         similarity = self._compute_similarity(current_signature, self.initial_signature)
 
         # Log adaptation metrics to wandb
-        self._log_to_wandb({
-            'adaptation/signature_similarity': similarity,
-            'adaptation/divergence': 1.0 - similarity,
-            'adaptation/threshold': self.adaptation_threshold,
-            'adaptation/is_adapted': self.is_adapted
-        })
+        self._log_to_wandb(
+            {
+                'adaptation/signature_similarity': similarity,
+                'adaptation/divergence': 1.0 - similarity,
+                'adaptation/threshold': self.adaptation_threshold,
+                'adaptation/is_adapted': self.is_adapted,
+            }
+        )
 
         # If signature has diverged enough, request knowledge
         if similarity < self.adaptation_threshold and not self.is_adapted:
@@ -502,7 +549,7 @@ class clientAPOP(Client):
 
     def _compute_similarity(self, sig1, sig2):
         """Compute enhanced similarity between two task signatures.
-        
+
         Uses a combination of cosine similarity and correlation for better matching.
         """
         try:
@@ -520,7 +567,7 @@ class clientAPOP(Client):
 
             # Method 1: Cosine similarity (primary)
             cosine_sim = np.dot(sig1, sig2) / (norm1 * norm2)
-            
+
             # Method 2: Pearson correlation coefficient (captures linear relationships)
             try:
                 correlation = np.corrcoef(sig1, sig2)[0, 1]
@@ -528,7 +575,7 @@ class clientAPOP(Client):
                     correlation = 0.0
             except:
                 correlation = 0.0
-            
+
             # Method 3: Normalized Euclidean distance (for local similarity)
             euclidean_dist = np.linalg.norm(sig1 - sig2)
             max_possible_dist = norm1 + norm2
@@ -536,52 +583,58 @@ class clientAPOP(Client):
                 euclidean_sim = 1.0 - (euclidean_dist / max_possible_dist)
             else:
                 euclidean_sim = 0.0
-            
+
             # Combine similarities with weights
             # Cosine similarity: 0.6, Correlation: 0.3, Euclidean: 0.1
             combined_similarity = (
-                0.6 * max(0.0, cosine_sim) + 
-                0.3 * max(0.0, correlation) + 
-                0.1 * max(0.0, euclidean_sim)
+                0.6 * max(0.0, cosine_sim)
+                + 0.3 * max(0.0, correlation)
+                + 0.1 * max(0.0, euclidean_sim)
             )
-            
+
             return min(1.0, max(0.0, combined_similarity))  # Ensure [0, 1] range
-            
+
         except Exception as e:
             print(f"[APOP] Warning: Similarity computation failed: {e}")
             return 0.0
 
     def load_train_data(self, batch_size=None):
         """Load training data with proper CIL filtering for personalized task sequences."""
-        from utils.data_utils import read_client_data
         from torch.utils.data import DataLoader
-        
+        from utils.data_utils import read_client_data
+
         if batch_size is None:
             batch_size = self.batch_size
-            
+
         # Load raw client data
-        train_data = read_client_data(self.dataset, self.id, is_train=True, few_shot=self.few_shot)
-        
+        train_data = read_client_data(
+            self.dataset, self.id, is_train=True, few_shot=self.few_shot
+        )
+
         # Apply CIL filtering based on task_sequence and current stage
         filtered_data = self._maybe_cil_filter(train_data, is_train=True)
-        
-        return DataLoader(filtered_data, batch_size=batch_size, drop_last=True, shuffle=True)
+
+        return DataLoader(
+            filtered_data, batch_size=batch_size, drop_last=True, shuffle=True
+        )
 
     def load_test_data(self, batch_size=None):
         """Load test data with proper CIL filtering for personalized task sequences."""
-        from utils.data_utils import read_client_data
         from torch.utils.data import DataLoader
-        
+        from utils.data_utils import read_client_data
+
         if batch_size is None:
             batch_size = self.batch_size
-            
+
         # Load raw client data
         test_data = read_client_data(self.dataset, self.id, is_train=False)
-        
+
         # Apply CIL filtering (usually cumulative for test)
         filtered_data = self._maybe_cil_filter(test_data, is_train=False)
-        
-        return DataLoader(filtered_data, batch_size=batch_size, drop_last=False, shuffle=False)
+
+        return DataLoader(
+            filtered_data, batch_size=batch_size, drop_last=False, shuffle=False
+        )
 
     def distill_knowledge(self, trainloader):
         """Distill knowledge basis from current task for contribution to server.

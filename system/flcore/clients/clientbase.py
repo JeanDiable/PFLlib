@@ -273,7 +273,9 @@ class Client(object):
             stage = getattr(self, 'cil_stage', None)
             if stage is None:
                 # Estimate based on local round counter
-                stage = int(self.train_time_cost['num_rounds'] // self.cil_rounds_per_class)
+                stage = int(
+                    self.train_time_cost['num_rounds'] // self.cil_rounds_per_class
+                )
 
         # allowed classes
         if is_train:

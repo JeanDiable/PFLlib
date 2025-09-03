@@ -41,6 +41,7 @@ class APOP(Server):
         try:
             if hasattr(self, 'wandb_enable') and self.wandb_enable:
                 import wandb
+
                 wandb.log(metrics_dict)
         except Exception:
             pass  # Fail silently if wandb not available
@@ -52,11 +53,19 @@ class APOP(Server):
 
         # PFTIL: When both TIL and personalized task sequences are enabled,
         # each client should follow their own task sequence without global CIL constraints
-        if self.til_enable and hasattr(self, 'client_sequences') and self.client_sequences:
-            print(f"[APOP-PFTIL] Round {current_round}: Using personalized task sequences (no global CIL constraints)")
+        if (
+            self.til_enable
+            and hasattr(self, 'client_sequences')
+            and self.client_sequences
+        ):
+            print(
+                f"[APOP-PFTIL] Round {current_round}: Using personalized task sequences (no global CIL constraints)"
+            )
             # Set each client's CIL stage to allow access to all their task classes
             for client in self.clients:
-                client.cil_stage = self.num_classes  # Allow full class access for personalized sequences
+                client.cil_stage = (
+                    self.num_classes
+                )  # Allow full class access for personalized sequences
             return
 
         # Standard CIL: Determine the active class range based on current round
@@ -166,32 +175,52 @@ class APOP(Server):
             if self.til_enable and hasattr(client, 'current_task_classes'):
                 # Determine if this is a task boundary or client needs past bases
                 is_task_boundary = (
-                    self.cil_rounds_per_class > 0 and 
-                    current_round % self.cil_rounds_per_class == 0 and 
-                    current_round > 0
+                    self.cil_rounds_per_class > 0
+                    and current_round % self.cil_rounds_per_class == 0
+                    and current_round > 0
                 )
-                
+
                 # Also provide past bases if client doesn't have them but should
-                client_task_idx = current_round // self.cil_rounds_per_class if self.cil_rounds_per_class > 0 else 0
-                should_have_past_bases = client_task_idx > 0 and client_id in self.client_past_bases
-                client_has_past_bases = hasattr(client, 'past_bases') and client.past_bases is not None
-                
-                if is_task_boundary or (should_have_past_bases and not client_has_past_bases):
+                client_task_idx = (
+                    current_round // self.cil_rounds_per_class
+                    if self.cil_rounds_per_class > 0
+                    else 0
+                )
+                should_have_past_bases = (
+                    client_task_idx > 0 and client_id in self.client_past_bases
+                )
+                client_has_past_bases = (
+                    hasattr(client, 'past_bases') and client.past_bases is not None
+                )
+
+                if is_task_boundary or (
+                    should_have_past_bases and not client_has_past_bases
+                ):
                     past_bases = self.client_past_bases.get(client_id, None)
                     if past_bases is not None:
                         client.set_past_bases(past_bases)
                         if is_task_boundary:
-                            print(f"[APOP] Client {client_id} starting task {client_task_idx}, provided past bases: {past_bases.shape}")
+                            print(
+                                f"[APOP] Client {client_id} starting task {client_task_idx}, provided past bases: {past_bases.shape}"
+                            )
                         else:
-                            print(f"[APOP] Client {client_id} provided missing past bases: {past_bases.shape}")
-                        
+                            print(
+                                f"[APOP] Client {client_id} provided missing past bases: {past_bases.shape}"
+                            )
+
                         # Log to wandb
-                        self._log_to_wandb({
-                            f'server/client_{client_id}_past_bases_provided': 1,
-                            f'server/client_{client_id}_task_index': client_task_idx,
-                            f'server/client_{client_id}_past_bases_shape_0': past_bases.shape[0],
-                            f'server/client_{client_id}_past_bases_shape_1': past_bases.shape[1]
-                        })
+                        self._log_to_wandb(
+                            {
+                                f'server/client_{client_id}_past_bases_provided': 1,
+                                f'server/client_{client_id}_task_index': client_task_idx,
+                                f'server/client_{client_id}_past_bases_shape_0': past_bases.shape[
+                                    0
+                                ],
+                                f'server/client_{client_id}_past_bases_shape_1': past_bases.shape[
+                                    1
+                                ],
+                            }
+                        )
 
     def _handle_knowledge_transfer_request(self, client):
         """Handle a client's request for knowledge transfer."""
@@ -524,7 +553,7 @@ class APOP(Server):
 
     def _compute_similarity(self, sig1, sig2):
         """Compute enhanced similarity between two task signatures.
-        
+
         Uses a combination of cosine similarity and correlation for better matching.
         """
         try:
@@ -542,7 +571,7 @@ class APOP(Server):
 
             # Method 1: Cosine similarity (primary)
             cosine_sim = np.dot(sig1, sig2) / (norm1 * norm2)
-            
+
             # Method 2: Pearson correlation coefficient (captures linear relationships)
             try:
                 correlation = np.corrcoef(sig1, sig2)[0, 1]
@@ -550,7 +579,7 @@ class APOP(Server):
                     correlation = 0.0
             except:
                 correlation = 0.0
-            
+
             # Method 3: Normalized Euclidean distance (for local similarity)
             euclidean_dist = np.linalg.norm(sig1 - sig2)
             max_possible_dist = norm1 + norm2
@@ -558,17 +587,17 @@ class APOP(Server):
                 euclidean_sim = 1.0 - (euclidean_dist / max_possible_dist)
             else:
                 euclidean_sim = 0.0
-            
+
             # Combine similarities with weights
             # Cosine similarity: 0.6, Correlation: 0.3, Euclidean: 0.1
             combined_similarity = (
-                0.6 * max(0.0, cosine_sim) + 
-                0.3 * max(0.0, correlation) + 
-                0.1 * max(0.0, euclidean_sim)
+                0.6 * max(0.0, cosine_sim)
+                + 0.3 * max(0.0, correlation)
+                + 0.1 * max(0.0, euclidean_sim)
             )
-            
+
             return min(1.0, max(0.0, combined_similarity))  # Ensure [0, 1] range
-            
+
         except Exception as e:
             print(f"[APOP-KB] Warning: Similarity computation failed: {e}")
             return 0.0
@@ -582,18 +611,18 @@ class APOP(Server):
                 return
 
             print(f"[APOP] Parsing client sequences: {client_sequences}")
-            
+
             # Parse format: "0:0,1|2,3;1:2,3|0,1;2:0,1|2,3"
             # Format: client_id:task1_classes|task2_classes;next_client:...
             client_assignments = {}
-            
+
             for client_spec in client_sequences.split(';'):
                 if ':' not in client_spec:
                     continue
-                    
+
                 client_id_str, tasks_str = client_spec.split(':', 1)
                 client_id = int(client_id_str.strip())
-                
+
                 # Parse tasks: "0,1|2,3" -> [[0,1], [2,3]]
                 task_sequence = []
                 for task_spec in tasks_str.split('|'):
@@ -604,7 +633,7 @@ class APOP(Server):
                             task_classes.append(int(class_str))
                     if task_classes:
                         task_sequence.append(task_classes)
-                
+
                 if task_sequence:
                     client_assignments[client_id] = task_sequence
                     print(f"[APOP] Client {client_id} task sequence: {task_sequence}")
@@ -613,10 +642,14 @@ class APOP(Server):
             for client in self.clients:
                 if client.id in client_assignments:
                     client.task_sequence = client_assignments[client.id]
-                    print(f"[APOP] Assigned task sequence to client {client.id}: {client.task_sequence}")
+                    print(
+                        f"[APOP] Assigned task sequence to client {client.id}: {client.task_sequence}"
+                    )
                 else:
-                    print(f"[APOP] WARNING: No task sequence found for client {client.id}")
-                    
+                    print(
+                        f"[APOP] WARNING: No task sequence found for client {client.id}"
+                    )
+
         except Exception as e:
             print(f"[APOP] ERROR parsing client_sequences: {e}")
             print("[APOP] Falling back to default CIL behavior")
@@ -625,7 +658,9 @@ class APOP(Server):
         """Set current task classes for TIL based on personalized task sequences."""
         try:
             if not hasattr(client, 'task_sequence') or not client.task_sequence:
-                print(f"[APOP] WARNING: Client {client.id} has no task_sequence, using default")
+                print(
+                    f"[APOP] WARNING: Client {client.id} has no task_sequence, using default"
+                )
                 return
 
             # Determine current task index based on round and cil_rounds_per_class
@@ -640,12 +675,18 @@ class APOP(Server):
 
             # Set current task classes
             if current_task_idx < len(client.task_sequence):
-                client.current_task_classes = set(client.task_sequence[current_task_idx])
+                client.current_task_classes = set(
+                    client.task_sequence[current_task_idx]
+                )
                 client.current_task_idx = current_task_idx
-                
-                print(f"[TIL] Client {client.id} Round {current_round}: Task {current_task_idx}, Classes {sorted(client.current_task_classes)}")
+
+                print(
+                    f"[TIL] Client {client.id} Round {current_round}: Task {current_task_idx}, Classes {sorted(client.current_task_classes)}"
+                )
             else:
-                print(f"[APOP] WARNING: Client {client.id} task index {current_task_idx} out of range for sequence {client.task_sequence}")
+                print(
+                    f"[APOP] WARNING: Client {client.id} task index {current_task_idx} out of range for sequence {client.task_sequence}"
+                )
 
         except Exception as e:
             print(f"[APOP] ERROR setting current task for client {client.id}: {e}")
