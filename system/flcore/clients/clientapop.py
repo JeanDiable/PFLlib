@@ -29,7 +29,12 @@ class clientAPOP(Client):
         self.similarity_retrieved = 0.0  # sim_retrieved
 
         # Store past task signatures for server queries
-        self.past_task_signatures = {}  # {task_id: signature} for querying updated bases
+        self.past_task_signatures = (
+            {}
+        )  # {task_id: signature} for querying updated bases
+
+        # Ensure TIL is enabled for proper task-specific evaluation
+        self.til_enable = getattr(args, 'til_enable', False)
 
         print(
             f"[APOP] Client {self.id} initialized with subspace_dim={self.subspace_dim}, "
@@ -119,10 +124,16 @@ class clientAPOP(Client):
         current_task_idx = getattr(self, 'current_task_idx', 0)
 
         if current_task_idx == 0:
-            print(f"[APOP] Client {self.id} ⭐ STARTING TASK {current_task_idx} (First Task - Free Training)")
+            print(
+                f"[APOP] Client {self.id} ⭐ STARTING TASK {current_task_idx} (First Task - Free Training)"
+            )
         else:
-            print(f"[APOP] Client {self.id} 🔄 STARTING TASK {current_task_idx} (APOP Mode)")
-            print(f"[APOP] Client {self.id} 📋 Will query server for updated past bases using stored signatures...")
+            print(
+                f"[APOP] Client {self.id} 🔄 STARTING TASK {current_task_idx} (APOP Mode)"
+            )
+            print(
+                f"[APOP] Client {self.id} 📋 Will query server for updated past bases using stored signatures..."
+            )
 
         # Compute initial task signature
         self.initial_signature = self._compute_task_signature(trainloader)
@@ -132,7 +143,9 @@ class clientAPOP(Client):
 
         # Query server for updated past bases using stored signatures
         if self.current_task_idx > 0 and self.past_task_signatures:
-            print(f"[APOP] Client {self.id} 🔍 Querying Server for Updated Past Bases using {len(self.past_task_signatures)} signatures...")
+            print(
+                f"[APOP] Client {self.id} 🔍 Querying Server for Updated Past Bases using {len(self.past_task_signatures)} signatures..."
+            )
             self._query_past_bases_from_server()
         else:
             self.past_bases = None
@@ -525,7 +538,9 @@ class clientAPOP(Client):
         # This will be called by the server during client setup
         # The server will use self.past_task_signatures to retrieve updated bases
         self.needs_past_bases_query = True
-        print(f"[APOP] Client {self.id} 📤 Requesting updated bases for {len(self.past_task_signatures)} past tasks")
+        print(
+            f"[APOP] Client {self.id} 📤 Requesting updated bases for {len(self.past_task_signatures)} past tasks"
+        )
 
     def _compute_similarity(self, sig1, sig2):
         """Compute enhanced similarity between two task signatures.
@@ -706,12 +721,16 @@ class clientAPOP(Client):
 
     def finish_current_task(self, trainloader):
         """Complete current task and prepare for next task."""
-        print(f"[APOP] Client {self.id} 🎓 TASK {self.current_task_idx} COMPLETED! Contributing knowledge to server")
+        print(
+            f"[APOP] Client {self.id} 🎓 TASK {self.current_task_idx} COMPLETED! Contributing knowledge to server"
+        )
 
         # Compute final task signature and store it for future queries
         final_signature = self._compute_task_signature(trainloader)
         self.past_task_signatures[self.current_task_idx] = final_signature
-        print(f"[APOP] Client {self.id} 💾 Stored signature for Task {self.current_task_idx} (total: {len(self.past_task_signatures)} past signatures)")
+        print(
+            f"[APOP] Client {self.id} 💾 Stored signature for Task {self.current_task_idx} (total: {len(self.past_task_signatures)} past signatures)"
+        )
 
         # Distill knowledge for server contribution
         knowledge_basis = self.distill_knowledge(trainloader)
@@ -729,6 +748,8 @@ class clientAPOP(Client):
         """Set updated past task bases received from server query."""
         self.past_bases = past_bases
         if past_bases is not None:
-            print(f"[APOP] Client {self.id} 📚 Updated Past Bases Received! Shape: {past_bases.shape}, Enabling Orthogonal Projection")
+            print(
+                f"[APOP] Client {self.id} 📚 Updated Past Bases Received! Shape: {past_bases.shape}, Enabling Orthogonal Projection"
+            )
         else:
             print(f"[APOP] Client {self.id} ⚠️  No past bases available")

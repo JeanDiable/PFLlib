@@ -289,11 +289,19 @@ class Client(object):
             if not allowed and stages:  # fallback to first stage
                 allowed = set(stages[0])
         else:
-            # Eval on cumulative classes seen so far
-            allowed = set()
-            for s in range(min(stage + 1, len(stages))):
-                if s >= 0 and s < len(stages):
-                    allowed.update(stages[s])
+            # For TIL evaluation with current_task_classes set, use task-specific classes
+            if (
+                getattr(self, 'til_enable', False)
+                and hasattr(self, 'current_task_classes')
+                and self.current_task_classes
+            ):
+                allowed = set(self.current_task_classes)
+            else:
+                # Standard CIL: Eval on cumulative classes seen so far
+                allowed = set()
+                for s in range(min(stage + 1, len(stages))):
+                    if s >= 0 and s < len(stages):
+                        allowed.update(stages[s])
 
         # Count original data for suspicious filtering detection
         original_class_counts = {}

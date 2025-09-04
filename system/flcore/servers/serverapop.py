@@ -170,54 +170,71 @@ class APOP(Server):
         """Query knowledge base for updated past bases using client signatures."""
         for client in self.clients:
             client_id = client.id
-            
-            # Check if client needs past bases query  
-            if hasattr(client, 'needs_past_bases_query') and client.needs_past_bases_query:
-                print(f"[APOP] Server processing past bases query for Client {client_id}")
-                
+
+            # Check if client needs past bases query
+            if (
+                hasattr(client, 'needs_past_bases_query')
+                and client.needs_past_bases_query
+            ):
+                print(
+                    f"[APOP] Server processing past bases query for Client {client_id}"
+                )
+
                 # Get client's past task signatures
                 past_signatures = getattr(client, 'past_task_signatures', {})
-                
+
                 if past_signatures:
                     # Query knowledge base for each past signature and get updated bases
                     past_bases_list = []
                     for task_id, signature in past_signatures.items():
-                        retrieved_basis, similarity = self._query_knowledge_base(signature)
+                        retrieved_basis, similarity = self._query_knowledge_base(
+                            signature
+                        )
                         if retrieved_basis is not None:
                             past_bases_list.append(retrieved_basis)
-                            print(f"[APOP] Server found updated basis for Client {client_id} Task {task_id}, similarity: {similarity:.3f}")
-                    
+                            print(
+                                f"[APOP] Server found updated basis for Client {client_id} Task {task_id}, similarity: {similarity:.3f}"
+                            )
+
                     if past_bases_list:
                         # Stack all past bases into one matrix
-                        stacked_past_bases = self._stack_and_orthogonalize_bases(past_bases_list)
+                        stacked_past_bases = self._stack_and_orthogonalize_bases(
+                            past_bases_list
+                        )
                         client.set_past_bases(stacked_past_bases)
-                        print(f"[APOP] Server provided {len(past_bases_list)} updated past bases to Client {client_id}, final shape: {stacked_past_bases.shape}")
+                        print(
+                            f"[APOP] Server provided {len(past_bases_list)} updated past bases to Client {client_id}, final shape: {stacked_past_bases.shape}"
+                        )
                     else:
                         client.set_past_bases(None)
-                        print(f"[APOP] Server: No matching bases found for Client {client_id}")
-                
+                        print(
+                            f"[APOP] Server: No matching bases found for Client {client_id}"
+                        )
+
                 # Clear the query flag
                 client.needs_past_bases_query = False
 
     def _stack_and_orthogonalize_bases(self, bases_list):
         """Stack multiple bases and orthogonalize them using QR decomposition.
-        
+
         Args:
             bases_list: List of basis matrices from different tasks
-            
+
         Returns:
             Orthogonalized stacked basis matrix
         """
         try:
             # Stack all bases horizontally: [B1 | B2 | B3 | ...]
             stacked = np.hstack(bases_list)
-            
+
             # Use QR decomposition to orthogonalize the combined basis
             Q, R = np.linalg.qr(stacked)
-            
-            print(f"[APOP] Server stacked {len(bases_list)} bases, final orthogonal basis: {Q.shape}")
+
+            print(
+                f"[APOP] Server stacked {len(bases_list)} bases, final orthogonal basis: {Q.shape}"
+            )
             return Q
-            
+
         except Exception as e:
             print(f"[APOP] ERROR: Failed to stack and orthogonalize bases: {e}")
             # Fallback: just return the first basis
