@@ -36,15 +36,39 @@ class APOP(Server):
             f"subspace_dim={self.subspace_dim}, fusion_threshold={self.fusion_threshold}"
         )
 
-    def _log_to_wandb(self, metrics_dict):
-        """Log metrics to wandb if available."""
-        try:
-            if hasattr(self, 'wandb_enable') and self.wandb_enable:
+    def _log_client_apop_metrics_to_wandb(self, round_num):
+        """Collect and log APOP client metrics to wandb."""
+        if not self.wandb_enable or not hasattr(self, 'wandb_run'):
+            return
+
+        all_metrics = {'round': round_num}
+
+        # Collect metrics from all clients
+        for client in self.clients:
+            if hasattr(client, 'apop_metrics') and client.apop_metrics:
+                # Log all stored metrics for this client
+                for metric_key, metrics in client.apop_metrics.items():
+                    client_id = metrics['client_id']
+                    # Add client prefix to all metric names
+                    for key, value in metrics.items():
+                        if key not in ['round', 'client_id']:  # Skip meta fields
+                            prefixed_key = f"client_{client_id}/{key}"
+                            all_metrics[prefixed_key] = value
+
+                # Clear metrics after logging to avoid duplicates
+                client.apop_metrics = {}
+
+        # Log all collected metrics to wandb
+        if len(all_metrics) > 1:  # More than just 'round'
+            try:
                 import wandb
 
-                wandb.log(metrics_dict)
-        except Exception:
-            pass  # Fail silently if wandb not available
+                wandb.log(all_metrics)
+                print(
+                    f"[APOP-WANDB] Logged {len(all_metrics)-1} APOP metrics to wandb for round {round_num}"
+                )
+            except Exception as e:
+                print(f"[APOP-WANDB] WARNING: Failed to log APOP metrics: {e}")
 
     def _update_client_stages(self, current_round):
         """Update client stages for CIL if enabled (inherited from Server)."""
@@ -117,6 +141,8 @@ class APOP(Server):
 
             # APOP: Handle knowledge transfer requests during training
             for client in self.selected_clients:
+                # Set current round for client metrics timestamping
+                client.current_round = i
                 client.train()
 
                 # Check if client needs knowledge transfer
@@ -142,6 +168,9 @@ class APOP(Server):
             if hasattr(self, 'wandb_enable') and self.wandb_enable:
                 avg_train_loss = self._collect_training_losses()
                 self._log_training_metrics_to_wandb(i, avg_train_loss)
+
+            # Log APOP client metrics to wandb
+            self._log_client_apop_metrics_to_wandb(i)
 
             self.Budget.append(time.time() - s_t)
             print('-' * 25, 'time cost', '-' * 25, self.Budget[-1])
