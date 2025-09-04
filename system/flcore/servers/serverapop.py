@@ -215,25 +215,80 @@ class APOP(Server):
                 client.needs_past_bases_query = False
 
     def _stack_and_orthogonalize_bases(self, bases_list):
-        """Stack multiple bases and orthogonalize them using QR decomposition.
+        """Stack multiple bases and orthogonalize them using SVD to filter redundant components.
 
         Args:
             bases_list: List of basis matrices from different tasks
 
         Returns:
-            Orthogonalized stacked basis matrix
+            Orthogonalized stacked basis matrix with redundant components filtered out
         """
         try:
             # Stack all bases horizontally: [B1 | B2 | B3 | ...]
             stacked = np.hstack(bases_list)
 
-            # Use QR decomposition to orthogonalize the combined basis
-            Q, R = np.linalg.qr(stacked)
+            print(
+                f"[APOP] Server stacking {len(bases_list)} bases, input shape: {stacked.shape}"
+            )
+
+            # Use SVD to orthogonalize and filter redundant components
+            U, S, Vt = np.linalg.svd(stacked, full_matrices=False)
+
+            # Keep only truly important components using SVD analysis
+            # Use spectral gap detection and cumulative energy thresholds
+            cumulative_energy_threshold = (
+                0.95  # Keep components explaining 95% of variance
+            )
+            spectral_gap_ratio = 0.1  # Significant drop in singular values
+
+            if len(S) > 0:
+                # Method 1: Cumulative energy (most important)
+                total_energy = np.sum(S**2)
+                cumulative_energy = np.cumsum(S**2) / total_energy
+                energy_rank = (
+                    np.sum(cumulative_energy < cumulative_energy_threshold) + 1
+                )
+
+                # Method 2: Spectral gap detection
+                if len(S) > 1:
+                    ratios = S[1:] / S[:-1]  # Ratio of consecutive singular values
+                    gap_indices = np.where(ratios < spectral_gap_ratio)[0]
+                    spectral_rank = (
+                        gap_indices[0] + 1 if len(gap_indices) > 0 else len(S)
+                    )
+                else:
+                    spectral_rank = 1
+
+                # Use the most conservative (smallest) rank
+                rank = min(
+                    energy_rank, spectral_rank, self.subspace_dim // 2
+                )  # Never exceed half of subspace_dim
+            else:
+                rank = 0
+
+            effective_rank = max(1, min(rank, self.subspace_dim * len(bases_list)))
 
             print(
-                f"[APOP] Server stacked {len(bases_list)} bases, final orthogonal basis: {Q.shape}"
+                f"[APOP] SVD analysis: energy_rank={energy_rank}, spectral_rank={spectral_rank}"
             )
-            return Q
+            print(
+                f"[APOP] Cumulative energy (95%): {cumulative_energy[energy_rank-1]:.4f}"
+            )
+
+            print(f"[APOP] SVD results: U={U.shape}, S={S.shape}")
+            print(
+                f"[APOP] Rank analysis: full_rank={len(S)}, effective_rank={rank}, using={effective_rank}"
+            )
+            print(f"[APOP] Singular values (top 10): {S[:10]}")
+            print(f"[APOP] Energy ratios (top 10): {(S**2)[:10] / total_energy}")
+
+            # Keep only the most important orthogonal directions
+            Q_filtered = U[:, :effective_rank]
+
+            print(
+                f"[APOP] Server stacked {len(bases_list)} bases, final orthogonal basis: {Q_filtered.shape}"
+            )
+            return Q_filtered
 
         except Exception as e:
             print(f"[APOP] ERROR: Failed to stack and orthogonalize bases: {e}")
@@ -371,17 +426,59 @@ class APOP(Server):
             print(f"[APOP-KB] - New basis shape: {basis_new.shape}")
             print(f"[APOP-KB] - Previous fusion count: {fusion_count}")
 
-            # Stack bases and perform SVD fusion
+            # Stack bases and perform SVD fusion with proper filtering
             stacked_bases = np.hstack([basis_existing, basis_new])
             print(f"[APOP-KB] - Stacked bases shape: {stacked_bases.shape}")
 
             U, S, Vt = np.linalg.svd(stacked_bases, full_matrices=False)
+
+            # Keep only truly important components using SVD analysis
+            # Use spectral gap detection and cumulative energy thresholds
+            cumulative_energy_threshold = 0.90  # Keep components explaining 90% of variance (more aggressive for fusion)
+            spectral_gap_ratio = 0.15  # More aggressive gap detection for fusion
+
+            if len(S) > 0:
+                # Method 1: Cumulative energy (most important)
+                total_energy = np.sum(S**2)
+                cumulative_energy = np.cumsum(S**2) / total_energy
+                energy_rank = (
+                    np.sum(cumulative_energy < cumulative_energy_threshold) + 1
+                )
+
+                # Method 2: Spectral gap detection
+                if len(S) > 1:
+                    ratios = S[1:] / S[:-1]  # Ratio of consecutive singular values
+                    gap_indices = np.where(ratios < spectral_gap_ratio)[0]
+                    spectral_rank = (
+                        gap_indices[0] + 1 if len(gap_indices) > 0 else len(S)
+                    )
+                else:
+                    spectral_rank = 1
+
+                # Use the most conservative (smallest) rank for fusion
+                effective_rank = min(
+                    energy_rank, spectral_rank, self.subspace_dim // 3
+                )  # Very aggressive for fusion
+            else:
+                effective_rank = 0
+
+            target_rank = max(1, min(effective_rank, self.subspace_dim))
+
             print(
-                f"[APOP-KB] - SVD results: U={U.shape}, S={S.shape}, rank={np.sum(S > 1e-8)}"
+                f"[APOP-KB] - SVD analysis: energy_rank={energy_rank}, spectral_rank={spectral_rank}"
+            )
+            print(
+                f"[APOP-KB] - Cumulative energy (90%): {cumulative_energy[energy_rank-1]:.4f}"
             )
 
-            # Extract fused basis
-            fused_basis = U[:, : self.subspace_dim]
+            print(f"[APOP-KB] - SVD results: U={U.shape}, S={S.shape}")
+            print(
+                f"[APOP-KB] - Rank analysis: full_rank={len(S)}, effective_rank={effective_rank}, using={target_rank}"
+            )
+            print(f"[APOP-KB] - Singular values (top 10): {S[:10]}")
+
+            # Extract fused basis with only the most important components
+            fused_basis = U[:, :target_rank]
             print(f"[APOP-KB] - Fused basis shape: {fused_basis.shape}")
 
             # Update knowledge base entry

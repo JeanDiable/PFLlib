@@ -495,10 +495,6 @@ class clientAPOP(Client):
             parallel_norm = torch.norm(g_k_parallel).item()
             orthogonal_norm = torch.norm(g_k_orthogonal).item()
             if input_grad_norm > 0:
-                print(
-                    f"final_grad_norm: {final_grad_norm}, input_grad_norm: {input_grad_norm}"
-                )
-                print("=" * 100)
                 transfer_boost = final_grad_norm / input_grad_norm
                 self._log_to_wandb(
                     {
@@ -754,16 +750,60 @@ class clientAPOP(Client):
             # Create gradient matrix and perform SVD
             gradient_matrix = np.array(gradient_samples).T  # [param_dim, sample_dim]
 
-            # Perform SVD to extract knowledge basis
+            # Perform SVD to extract knowledge basis with proper filtering
             U, S, Vt = np.linalg.svd(gradient_matrix, full_matrices=False)
 
-            # Extract top-r basis vectors
-            knowledge_basis = U[:, : min(self.subspace_dim, U.shape[1])]
+            # Keep only truly important components using SVD analysis
+            # Use spectral gap detection and cumulative energy thresholds
+            cumulative_energy_threshold = (
+                0.85  # Keep components explaining 85% of variance (very aggressive)
+            )
+            spectral_gap_ratio = (
+                0.2  # Very aggressive gap detection for client distillation
+            )
+
+            if len(S) > 0:
+                # Method 1: Cumulative energy (most important)
+                total_energy = np.sum(S**2)
+                cumulative_energy = np.cumsum(S**2) / total_energy
+                energy_rank = (
+                    np.sum(cumulative_energy < cumulative_energy_threshold) + 1
+                )
+
+                # Method 2: Spectral gap detection
+                if len(S) > 1:
+                    ratios = S[1:] / S[:-1]  # Ratio of consecutive singular values
+                    gap_indices = np.where(ratios < spectral_gap_ratio)[0]
+                    spectral_rank = (
+                        gap_indices[0] + 1 if len(gap_indices) > 0 else len(S)
+                    )
+                else:
+                    spectral_rank = 1
+
+                # Use the most conservative (smallest) rank for distillation
+                effective_rank = min(
+                    energy_rank, spectral_rank, self.subspace_dim // 4
+                )  # Very aggressive for distillation
+            else:
+                effective_rank = 0
+
+            target_rank = max(1, min(effective_rank, self.subspace_dim, U.shape[1]))
+
+            print(
+                f"[APOP] Client {self.id} SVD analysis: energy_rank={energy_rank}, spectral_rank={spectral_rank}"
+            )
+            print(
+                f"[APOP] Client {self.id} cumulative energy (85%): {cumulative_energy[energy_rank-1]:.4f}"
+            )
+
+            # Extract top-r basis vectors (only the most important directions)
+            knowledge_basis = U[:, :target_rank]
 
             print(
                 f"[APOP] Client {self.id} distilled knowledge basis: "
-                f"shape={knowledge_basis.shape}, rank={np.linalg.matrix_rank(knowledge_basis)}"
+                f"shape={knowledge_basis.shape}, effective_rank={effective_rank}, target_rank={target_rank}"
             )
+            print(f"[APOP] Client {self.id} singular values (top 10): {S[:10]}")
 
             return knowledge_basis
 
