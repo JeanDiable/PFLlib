@@ -5,13 +5,13 @@
 
 # Configuration
 DATASET=${2:-"Cifar100"}  # Fixed: Use Cifar10 to match actual data
-NUM_CLIENTS=${3:-20}
-CILRPC=${4:-30}  # Rounds per task (main parameter to adjust)
+NUM_CLIENTS=${3:-10}
+CILRPC=${4:-40}  # Rounds per task (main parameter to adjust)
 SEQUENCE_FILE=${1:-""}
 
 # Task sequence configuration (adjusted for Cifar10)
-NUM_TASKS_PER_CLIENT=20  # Reduced to fit in 10 classes
-CLASSES_PER_TASK=5      # Use 2 classes per task to fit better
+NUM_TASKS_PER_CLIENT=10  # Reduced to fit in 10 classes
+CLASSES_PER_TASK=10      # Use 2 classes per task to fit better
 
 # Dataset-specific settings
 case $DATASET in
@@ -85,13 +85,14 @@ python main.py \
     -subspace_dim 25 \
     -adaptation_threshold 0.3 \
     -fusion_threshold 0.4 \
-    -max_transfer_gain 1.8 \
+    -max_transfer_gain 0 \
+    -min_adaptation_rounds 5 \
     -lr 0.01 \
-    -lbs 32 \
-    -ls 3 \
+    -lbs 16 \
+    -ls 10\
     -eg 5 \
     -wandb True \
     -wandb_project "iclr26" \
-    -go "fedavg_${DATASET}_${NUM_CLIENTS}c_${NUM_TASKS_PER_CLIENT}t_${CILRPC}rpt_fixed"
+    -go "${DATASET}_${NUM_CLIENTS}c_${NUM_TASKS_PER_CLIENT}t_${CILRPC}rpt"
 
 echo "Experiment completed!"

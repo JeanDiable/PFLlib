@@ -19,6 +19,9 @@ class clientAPOP(Client):
         self.max_transfer_gain = getattr(
             args, 'max_transfer_gain', 2.0
         )  # α_max in algorithm
+        self.min_adaptation_rounds = getattr(
+            args, 'min_adaptation_rounds', 5
+        )  # Minimum rounds before adaptation check
 
         # Client state
         self.past_bases = None  # B_k^past - updated bases from server query
@@ -32,6 +35,10 @@ class clientAPOP(Client):
         self.past_task_signatures = (
             {}
         )  # {task_id: signature} for querying updated bases
+
+        # Adaptation tracking
+        self.adaptation_round_count = 0  # Track adaptation progress
+        self.task_start_round = 0  # Remember when task started
 
         # Ensure TIL is enabled for proper task-specific evaluation
         self.til_enable = getattr(args, 'til_enable', False)
@@ -135,11 +142,19 @@ class clientAPOP(Client):
                 f"[APOP] Client {self.id} 📋 Will query server for updated past bases using stored signatures..."
             )
 
-        # Compute initial task signature
-        self.initial_signature = self._compute_task_signature(trainloader)
+        # Compute initial task signature (deterministic, fixed seed)
+        self.initial_signature = self._compute_task_signature(
+            trainloader, fixed_seed=True
+        )
         self.is_adapted = False
         self.parallel_basis = None
         self.similarity_retrieved = 0.0
+
+        # Reset adaptation tracking
+        self.adaptation_round_count = 0
+        self.task_start_round = getattr(self, 'train_time_cost', {}).get(
+            'num_rounds', 0
+        )
 
         # Query server for updated past bases using stored signatures
         if self.current_task_idx > 0 and self.past_task_signatures:
@@ -151,20 +166,34 @@ class clientAPOP(Client):
             self.past_bases = None
 
         print(
-            f"[APOP] Client {self.id} ✅ Task {current_task_idx} Initialized - Entering Adaptation Period"
+            f"[APOP] Client {self.id} ✅ Task {current_task_idx} Initialized - Entering Adaptation Period (min {self.min_adaptation_rounds} rounds)"
         )
 
-    def _compute_task_signature(self, trainloader):
+    def _compute_task_signature(self, trainloader, fixed_seed=False):
         """Compute task signature based on model gradients on sample data.
 
         Task signature represents the gradient direction characteristics of the current task.
         Uses dimensionality reduction for better similarity matching.
+
+        Args:
+            fixed_seed: If True, use fixed random seed for deterministic signature computation
         """
         self.model.eval()
 
+        # For deterministic signature computation, use fixed seed
+        if fixed_seed:
+            torch.manual_seed(42)
+            np.random.seed(42)
+
         # Use a small sample to compute signature
         try:
-            x, y = next(iter(trainloader))
+            # For deterministic computation, use first batch consistently
+            if fixed_seed:
+                trainloader_iter = iter(trainloader)
+                x, y = next(trainloader_iter)
+            else:
+                x, y = next(iter(trainloader))
+
             if type(x) == type([]):
                 x[0] = x[0].to(self.device)
             else:
@@ -459,13 +488,17 @@ class clientAPOP(Client):
             g_k_orthogonal = g_k_prime - g_k_parallel
 
             # Final modulated gradient: g_k'' = (1+α) g_k^∥ + g_k^⊥
-            g_k_final = (1 + alpha) * g_k_parallel + g_k_orthogonal
+            g_k_final = alpha * g_k_parallel + g_k_orthogonal
             final_grad_norm = torch.norm(g_k_final).item()
 
             # Log transfer effectiveness to wandb
             parallel_norm = torch.norm(g_k_parallel).item()
             orthogonal_norm = torch.norm(g_k_orthogonal).item()
             if input_grad_norm > 0:
+                print(
+                    f"final_grad_norm: {final_grad_norm}, input_grad_norm: {input_grad_norm}"
+                )
+                print("=" * 100)
                 transfer_boost = final_grad_norm / input_grad_norm
                 self._log_to_wandb(
                     {
@@ -493,11 +526,22 @@ class clientAPOP(Client):
             print(f"[APOP] ERROR: Parallel projection failed for client {self.id}: {e}")
 
     def _check_adaptation_status(self, trainloader):
-        """Check if client has adapted enough to request knowledge transfer."""
+        """Check if client has adapted enough to request knowledge transfer.
+
+        Adaptation is complete when:
+        1. Minimum adaptation rounds have passed, AND
+        2. Signature similarity drops below threshold
+        """
+        # Update adaptation round counter
+        self.adaptation_round_count += 1
+
         current_signature = self._compute_task_signature(trainloader)
 
         # Compute similarity with initial signature
         similarity = self._compute_similarity(current_signature, self.initial_signature)
+
+        # Check if minimum adaptation rounds have passed
+        min_rounds_passed = self.adaptation_round_count >= self.min_adaptation_rounds
 
         # Log adaptation metrics to wandb
         self._log_to_wandb(
@@ -506,24 +550,47 @@ class clientAPOP(Client):
                 'adaptation/divergence': 1.0 - similarity,
                 'adaptation/threshold': self.adaptation_threshold,
                 'adaptation/is_adapted': self.is_adapted,
+                'adaptation/round_count': self.adaptation_round_count,
+                'adaptation/min_rounds_passed': min_rounds_passed,
             }
         )
 
-        # If signature has diverged enough, request knowledge
-        if similarity < self.adaptation_threshold and not self.is_adapted:
+        # Adaptation is complete when BOTH conditions are met
+        if (
+            similarity < self.adaptation_threshold
+            and min_rounds_passed
+            and not self.is_adapted
+        ):
             print(
-                f"[APOP] Client {self.id} 🎯 ADAPTATION COMPLETE for Task {self.current_task_idx}! Similarity: {similarity:.3f} < {self.adaptation_threshold}"
+                f"[APOP] Client {self.id} 🎯 ADAPTATION COMPLETE for Task {self.current_task_idx}!"
+            )
+            print(
+                f"[APOP] Client {self.id} ⏰ Rounds: {self.adaptation_round_count} (min: {self.min_adaptation_rounds})"
+            )
+            print(
+                f"[APOP] Client {self.id} 📊 Similarity: {similarity:.3f} < {self.adaptation_threshold}"
             )
             print(
                 f"[APOP] Client {self.id} 🔍 Requesting Knowledge Transfer from Server..."
             )
             self.is_adapted = True
             self._request_knowledge_transfer(current_signature)
-        elif not self.is_adapted and self._gradient_mod_count % 100 == 1:
+        elif not self.is_adapted and self._gradient_mod_count % 50 == 1:
             # Log adaptation progress occasionally
-            remaining = similarity - self.adaptation_threshold
+            remaining_similarity = similarity - self.adaptation_threshold
+            remaining_rounds = max(
+                0, self.min_adaptation_rounds - self.adaptation_round_count
+            )
+
+            if not min_rounds_passed:
+                status = f"Waiting for min rounds ({self.adaptation_round_count}/{self.min_adaptation_rounds})"
+            elif similarity >= self.adaptation_threshold:
+                status = f"Need {remaining_similarity:.3f} more divergence"
+            else:
+                status = "Ready for knowledge transfer"
+
             print(
-                f"[APOP] Client {self.id} ⏳ Adapting Task {self.current_task_idx}... Progress: {similarity:.3f} → {self.adaptation_threshold:.3f} (need {remaining:.3f} more)"
+                f"[APOP] Client {self.id} ⏳ Adapting Task {self.current_task_idx}... {status}, Similarity: {similarity:.3f}"
             )
 
     def _request_knowledge_transfer(self, task_signature):
@@ -725,8 +792,8 @@ class clientAPOP(Client):
             f"[APOP] Client {self.id} 🎓 TASK {self.current_task_idx} COMPLETED! Contributing knowledge to server"
         )
 
-        # Compute final task signature and store it for future queries
-        final_signature = self._compute_task_signature(trainloader)
+        # Compute final task signature and store it for future queries (deterministic)
+        final_signature = self._compute_task_signature(trainloader, fixed_seed=True)
         self.past_task_signatures[self.current_task_idx] = final_signature
         print(
             f"[APOP] Client {self.id} 💾 Stored signature for Task {self.current_task_idx} (total: {len(self.past_task_signatures)} past signatures)"
@@ -739,6 +806,7 @@ class clientAPOP(Client):
         self.current_task_idx += 1
         self.is_adapted = False
         self.needs_knowledge_transfer = False
+        self.adaptation_round_count = 0  # Reset adaptation tracking
         if hasattr(self, '_task_initialized'):
             delattr(self, '_task_initialized')
 

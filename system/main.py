@@ -827,6 +827,13 @@ if __name__ == "__main__":
         default=2.0,
         help="Maximum transfer gain for parallel projection in APOP (α_max in algorithm)",
     )
+    parser.add_argument(
+        '-min_adaptation_rounds',
+        "--min_adaptation_rounds",
+        type=int,
+        default=5,
+        help="Minimum number of local training rounds before checking adaptation completion in APOP",
+    )
 
     args = parser.parse_args()
 
