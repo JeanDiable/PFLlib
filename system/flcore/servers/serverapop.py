@@ -167,60 +167,63 @@ class APOP(Server):
             self._compute_til_final_metrics()
 
     def _provide_past_bases_to_clients(self, current_round):
-        """Provide past task bases to clients at the start of new tasks."""
+        """Query knowledge base for updated past bases using client signatures."""
         for client in self.clients:
             client_id = client.id
+            
+            # Check if client needs past bases query  
+            if hasattr(client, 'needs_past_bases_query') and client.needs_past_bases_query:
+                print(f"[APOP] Server processing past bases query for Client {client_id}")
+                
+                # Get client's past task signatures
+                past_signatures = getattr(client, 'past_task_signatures', {})
+                
+                if past_signatures:
+                    # Query knowledge base for each past signature and get updated bases
+                    past_bases_list = []
+                    for task_id, signature in past_signatures.items():
+                        retrieved_basis, similarity = self._query_knowledge_base(signature)
+                        if retrieved_basis is not None:
+                            past_bases_list.append(retrieved_basis)
+                            print(f"[APOP] Server found updated basis for Client {client_id} Task {task_id}, similarity: {similarity:.3f}")
+                    
+                    if past_bases_list:
+                        # Stack all past bases into one matrix
+                        stacked_past_bases = self._stack_and_orthogonalize_bases(past_bases_list)
+                        client.set_past_bases(stacked_past_bases)
+                        print(f"[APOP] Server provided {len(past_bases_list)} updated past bases to Client {client_id}, final shape: {stacked_past_bases.shape}")
+                    else:
+                        client.set_past_bases(None)
+                        print(f"[APOP] Server: No matching bases found for Client {client_id}")
+                
+                # Clear the query flag
+                client.needs_past_bases_query = False
 
-            # Check if client is starting a new task or doesn't have past bases yet
-            if self.til_enable and hasattr(client, 'current_task_classes'):
-                # Determine if this is a task boundary or client needs past bases
-                is_task_boundary = (
-                    self.cil_rounds_per_class > 0
-                    and current_round % self.cil_rounds_per_class == 0
-                    and current_round > 0
-                )
-
-                # Also provide past bases if client doesn't have them but should
-                client_task_idx = (
-                    current_round // self.cil_rounds_per_class
-                    if self.cil_rounds_per_class > 0
-                    else 0
-                )
-                should_have_past_bases = (
-                    client_task_idx > 0 and client_id in self.client_past_bases
-                )
-                client_has_past_bases = (
-                    hasattr(client, 'past_bases') and client.past_bases is not None
-                )
-
-                if is_task_boundary or (
-                    should_have_past_bases and not client_has_past_bases
-                ):
-                    past_bases = self.client_past_bases.get(client_id, None)
-                    if past_bases is not None:
-                        client.set_past_bases(past_bases)
-                        if is_task_boundary:
-                            print(
-                                f"[APOP] Client {client_id} starting task {client_task_idx}, provided past bases: {past_bases.shape}"
-                            )
-                        else:
-                            print(
-                                f"[APOP] Client {client_id} provided missing past bases: {past_bases.shape}"
-                            )
-
-                        # Log to wandb
-                        self._log_to_wandb(
-                            {
-                                f'server/client_{client_id}_past_bases_provided': 1,
-                                f'server/client_{client_id}_task_index': client_task_idx,
-                                f'server/client_{client_id}_past_bases_shape_0': past_bases.shape[
-                                    0
-                                ],
-                                f'server/client_{client_id}_past_bases_shape_1': past_bases.shape[
-                                    1
-                                ],
-                            }
-                        )
+    def _stack_and_orthogonalize_bases(self, bases_list):
+        """Stack multiple bases and orthogonalize them using QR decomposition.
+        
+        Args:
+            bases_list: List of basis matrices from different tasks
+            
+        Returns:
+            Orthogonalized stacked basis matrix
+        """
+        try:
+            # Stack all bases horizontally: [B1 | B2 | B3 | ...]
+            stacked = np.hstack(bases_list)
+            
+            # Use QR decomposition to orthogonalize the combined basis
+            Q, R = np.linalg.qr(stacked)
+            
+            print(f"[APOP] Server stacked {len(bases_list)} bases, final orthogonal basis: {Q.shape}")
+            return Q
+            
+        except Exception as e:
+            print(f"[APOP] ERROR: Failed to stack and orthogonalize bases: {e}")
+            # Fallback: just return the first basis
+            if bases_list:
+                return bases_list[0]
+            return None
 
     def _handle_knowledge_transfer_request(self, client):
         """Handle a client's request for knowledge transfer."""

@@ -21,15 +21,15 @@ class clientAPOP(Client):
         )  # α_max in algorithm
 
         # Client state
-        self.past_bases = None  # B_k^past - stacked past task bases
+        self.past_bases = None  # B_k^past - updated bases from server query
         self.current_task_idx = 0
         self.is_adapted = False
         self.initial_signature = None
         self.parallel_basis = None  # B_∥^t - retrieved similar task basis
         self.similarity_retrieved = 0.0  # sim_retrieved
 
-        # Task signature history for analysis
-        self.task_signatures = {}
+        # Store past task signatures for server queries
+        self.past_task_signatures = {}  # {task_id: signature} for querying updated bases
 
         print(
             f"[APOP] Client {self.id} initialized with subspace_dim={self.subspace_dim}, "
@@ -41,32 +41,10 @@ class clientAPOP(Client):
         trainloader = self.load_train_data()
         self.model.train()
 
-        # DEBUG: Check if client is receiving any training data
+        # Check for empty training data
         if len(trainloader.dataset) == 0:
             print(f"[APOP] ERROR: Client {self.id} has EMPTY training dataset!")
-            print(
-                f"[APOP] Client {self.id} current_task_classes: {getattr(self, 'current_task_classes', 'None')}"
-            )
-            print(
-                f"[APOP] Client {self.id} current_task_idx: {getattr(self, 'current_task_idx', 'None')}"
-            )
             return
-        else:
-            # Sample a few data points to check classes
-            sample_classes = set()
-            for i, (_, y) in enumerate(trainloader):
-                if i >= 3:  # Check first 3 batches
-                    break
-                sample_classes.update(y.cpu().numpy().tolist())
-            print(
-                f"[APOP] DEBUG: Client {self.id} training data contains classes: {sorted(sample_classes)}"
-            )
-            print(
-                f"[APOP] DEBUG: Client {self.id} assigned task classes: {getattr(self, 'current_task_classes', 'None')}"
-            )
-            print(
-                f"[APOP] DEBUG: Client {self.id} dataset size: {len(trainloader.dataset)}"
-            )
 
         start_time = time.time()
         max_local_epochs = self.local_epochs
@@ -81,19 +59,6 @@ class clientAPOP(Client):
         if not hasattr(self, '_task_initialized'):
             self._initialize_new_task(trainloader)
             self._task_initialized = True
-
-        # Ensure past bases are set correctly for clients on subsequent tasks
-        if hasattr(self, 'current_task_idx') and self.current_task_idx > 0:
-            if not hasattr(self, 'past_bases') or self.past_bases is None:
-                print(
-                    f"[APOP] WARNING: Client {self.id} on task {self.current_task_idx} but no past_bases! This may cause adaptation issues."
-                )
-                self._log_to_wandb(
-                    {
-                        'training/missing_past_bases_warning': 1,
-                        'training/current_task_idx': self.current_task_idx,
-                    }
-                )
 
         for epoch in range(max_local_epochs):
             for i, (x, y) in enumerate(trainloader):
@@ -151,7 +116,13 @@ class clientAPOP(Client):
 
     def _initialize_new_task(self, trainloader):
         """Initialize state for a new task."""
-        print(f"[APOP] Client {self.id} initializing new task {self.current_task_idx}")
+        current_task_idx = getattr(self, 'current_task_idx', 0)
+
+        if current_task_idx == 0:
+            print(f"[APOP] Client {self.id} ⭐ STARTING TASK {current_task_idx} (First Task - Free Training)")
+        else:
+            print(f"[APOP] Client {self.id} 🔄 STARTING TASK {current_task_idx} (APOP Mode)")
+            print(f"[APOP] Client {self.id} 📋 Will query server for updated past bases using stored signatures...")
 
         # Compute initial task signature
         self.initial_signature = self._compute_task_signature(trainloader)
@@ -159,15 +130,15 @@ class clientAPOP(Client):
         self.parallel_basis = None
         self.similarity_retrieved = 0.0
 
-        # Request past bases from server if not first task
-        if self.current_task_idx > 0:
-            self.past_bases = getattr(self, 'server_past_bases', None)
+        # Query server for updated past bases using stored signatures
+        if self.current_task_idx > 0 and self.past_task_signatures:
+            print(f"[APOP] Client {self.id} 🔍 Querying Server for Updated Past Bases using {len(self.past_task_signatures)} signatures...")
+            self._query_past_bases_from_server()
         else:
             self.past_bases = None
 
         print(
-            f"[APOP] Client {self.id} task initialization complete. "
-            f"Past bases: {'Available' if self.past_bases is not None else 'None'}"
+            f"[APOP] Client {self.id} ✅ Task {current_task_idx} Initialized - Entering Adaptation Period"
         )
 
     def _compute_task_signature(self, trainloader):
@@ -319,33 +290,34 @@ class clientAPOP(Client):
         if self.is_adapted and self.parallel_basis is not None:
             self._apply_parallel_projection()
 
-        # Log important status changes or periodically
-        should_log = (
-            self._gradient_mod_count % 100 == 1  # Every 100 steps
-            or original_grad_norm > 1e8  # Gradient issues
-            or (
-                hasattr(self, '_last_logged_state')
-                and self._last_logged_state
-                != (
-                    self.past_bases is not None,
-                    self.is_adapted,
-                    self.parallel_basis is not None,
-                )
-            )  # State changes
+        # Log only important state changes
+        current_state = (
+            self.past_bases is not None,
+            self.is_adapted,
+            self.parallel_basis is not None,
         )
 
-        if should_log:
+        if (
+            not hasattr(self, '_last_logged_state')
+            or self._last_logged_state != current_state
+        ):
             final_grad_norm = self._get_gradient_norm()
-            status = f"Past:{self.past_bases is not None}, Adapted:{self.is_adapted}, Transfer:{self.parallel_basis is not None}"
+
+            # Create readable status
+            if self.current_task_idx == 0:
+                status_msg = "Free Training"
+            elif not self.is_adapted:
+                status_msg = "Adaptation Period (Orthogonal Only)"
+            elif self.parallel_basis is not None:
+                status_msg = "Full APOP (Orthogonal + Parallel)"
+            else:
+                status_msg = "Adapted (Waiting for Knowledge)"
+
             print(
-                f"[APOP] C{self.id} T{self.current_task_idx} S{self._gradient_mod_count}: {status} | Grad: {original_grad_norm:.2e}→{final_grad_norm:.2e}"
+                f"[APOP] Client {self.id} 📈 Task {self.current_task_idx} Status: {status_msg}"
             )
 
-            self._last_logged_state = (
-                self.past_bases is not None,
-                self.is_adapted,
-                self.parallel_basis is not None,
-            )
+            self._last_logged_state = current_state
 
             # Log to wandb if available
             self._log_to_wandb(
@@ -527,15 +499,18 @@ class clientAPOP(Client):
         # If signature has diverged enough, request knowledge
         if similarity < self.adaptation_threshold and not self.is_adapted:
             print(
-                f"[APOP] Client {self.id} T{self.current_task_idx} ADAPTATION COMPLETE! Similarity: {similarity:.3f} < {self.adaptation_threshold}"
+                f"[APOP] Client {self.id} 🎯 ADAPTATION COMPLETE for Task {self.current_task_idx}! Similarity: {similarity:.3f} < {self.adaptation_threshold}"
+            )
+            print(
+                f"[APOP] Client {self.id} 🔍 Requesting Knowledge Transfer from Server..."
             )
             self.is_adapted = True
             self._request_knowledge_transfer(current_signature)
-        elif not self.is_adapted and self._gradient_mod_count % 50 == 1:
+        elif not self.is_adapted and self._gradient_mod_count % 100 == 1:
             # Log adaptation progress occasionally
             remaining = similarity - self.adaptation_threshold
             print(
-                f"[APOP] Client {self.id} T{self.current_task_idx} adapting... Similarity: {similarity:.3f}, Need: {remaining:.3f} more divergence"
+                f"[APOP] Client {self.id} ⏳ Adapting Task {self.current_task_idx}... Progress: {similarity:.3f} → {self.adaptation_threshold:.3f} (need {remaining:.3f} more)"
             )
 
     def _request_knowledge_transfer(self, task_signature):
@@ -545,7 +520,12 @@ class clientAPOP(Client):
         self.needs_knowledge_transfer = True
         self.current_task_signature = task_signature
 
-        print(f"[APOP] Client {self.id} marked for knowledge transfer request")
+    def _query_past_bases_from_server(self):
+        """Query server for updated past bases using stored task signatures."""
+        # This will be called by the server during client setup
+        # The server will use self.past_task_signatures to retrieve updated bases
+        self.needs_past_bases_query = True
+        print(f"[APOP] Client {self.id} 📤 Requesting updated bases for {len(self.past_task_signatures)} past tasks")
 
     def _compute_similarity(self, sig1, sig2):
         """Compute enhanced similarity between two task signatures.
@@ -721,18 +701,17 @@ class clientAPOP(Client):
         self.similarity_retrieved = similarity_score
 
         print(
-            f"[APOP] Client {self.id} received knowledge transfer: "
-            f"basis_shape={parallel_basis.shape if parallel_basis is not None else 'None'}, "
-            f"similarity={similarity_score:.3f}"
+            f"[APOP] Client {self.id} 💡 Knowledge Transfer Received! Similarity: {similarity_score:.3f}, Enabling Parallel Projection"
         )
 
     def finish_current_task(self, trainloader):
         """Complete current task and prepare for next task."""
-        print(f"[APOP] Client {self.id} finishing task {self.current_task_idx}")
+        print(f"[APOP] Client {self.id} 🎓 TASK {self.current_task_idx} COMPLETED! Contributing knowledge to server")
 
-        # Compute final task signature
+        # Compute final task signature and store it for future queries
         final_signature = self._compute_task_signature(trainloader)
-        self.task_signatures[self.current_task_idx] = final_signature
+        self.past_task_signatures[self.current_task_idx] = final_signature
+        print(f"[APOP] Client {self.id} 💾 Stored signature for Task {self.current_task_idx} (total: {len(self.past_task_signatures)} past signatures)")
 
         # Distill knowledge for server contribution
         knowledge_basis = self.distill_knowledge(trainloader)
@@ -741,14 +720,15 @@ class clientAPOP(Client):
         self.current_task_idx += 1
         self.is_adapted = False
         self.needs_knowledge_transfer = False
-        delattr(self, '_task_initialized')
+        if hasattr(self, '_task_initialized'):
+            delattr(self, '_task_initialized')
 
         return final_signature, knowledge_basis
 
     def set_past_bases(self, past_bases):
-        """Set past task bases received from server."""
+        """Set updated past task bases received from server query."""
         self.past_bases = past_bases
-        print(
-            f"[APOP] Client {self.id} received past bases: "
-            f"shape={past_bases.shape if past_bases is not None else 'None'}"
-        )
+        if past_bases is not None:
+            print(f"[APOP] Client {self.id} 📚 Updated Past Bases Received! Shape: {past_bases.shape}, Enabling Orthogonal Projection")
+        else:
+            print(f"[APOP] Client {self.id} ⚠️  No past bases available")
