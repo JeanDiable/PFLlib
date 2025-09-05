@@ -363,8 +363,8 @@ class clientAPOP(Client):
             self._apply_gmp_projection()
 
         # Step 2: Parallel projection for knowledge transfer (if adapted)
-        if self.is_adapted and self.parallel_basis is not None:
-            self._apply_parallel_projection()
+        # if self.is_adapted and self.parallel_basis is not None:
+        #     self._apply_parallel_projection()
 
         # Log only important state changes
         current_state = (
@@ -446,55 +446,24 @@ class clientAPOP(Client):
             if B_parallel.size(0) != g_k_prime.size(0):
                 # This is expected! Server basis is smaller than full gradient space
                 print(
-                    f"[APOP] Client {self.id} Parallel projection: adapting server basis {B_parallel.shape} to gradient space {g_k_prime.shape}"
+                    # f"[APOP] Client {self.id} Parallel projection: adapting server basis {B_parallel.shape} to gradient space {g_k_prime.shape}"
                 )
 
                 # Option 1: Project only the first N dimensions where server basis applies
                 if B_parallel.size(0) <= g_k_prime.size(0):
                     # Take first B_parallel.size(0) dimensions of gradient
                     g_k_subset = g_k_prime[: B_parallel.size(0)]
-                    print(
-                        f"[DEBUG] Client {self.id} B_parallel.shape: {B_parallel.shape}"
-                    )
-                    print(
-                        f"[DEBUG] Client {self.id} g_k_subset.shape: {g_k_subset.shape}"
-                    )
-                    print(
-                        f"[DEBUG] Client {self.id} B_parallel.t().shape: {B_parallel.t().shape}"
-                    )
+                    # Apply projection to subset
+                    BT_g = torch.matmul(
+                        B_parallel.t(), g_k_subset.unsqueeze(-1)
+                    ).squeeze(-1)
+                    g_k_parallel_subset = torch.matmul(
+                        B_parallel, BT_g.unsqueeze(-1)
+                    ).squeeze(-1)
 
-                    # Apply projection to subset - DETAILED DEBUGGING
-                    try:
-                        BT_g = torch.matmul(
-                            B_parallel.t(), g_k_subset.unsqueeze(-1)
-                        ).squeeze(-1)
-                        print(f"[DEBUG] Client {self.id} BT_g.shape: {BT_g.shape}")
-
-                        g_k_parallel_subset = torch.matmul(
-                            B_parallel, BT_g.unsqueeze(-1)
-                        ).squeeze(-1)
-                        print(
-                            f"[DEBUG] Client {self.id} g_k_parallel_subset.shape: {g_k_parallel_subset.shape}"
-                        )
-
-                        # Create full parallel gradient by padding with zeros
-                        g_k_parallel = torch.zeros_like(g_k_prime)
-                        g_k_parallel[: B_parallel.size(0)] = g_k_parallel_subset
-                        print(f"[DEBUG] Client {self.id} Parallel projection SUCCESS!")
-
-                    except Exception as e:
-                        print(
-                            f"[DEBUG] Client {self.id} PARALLEL PROJECTION FAILED: {e}"
-                        )
-                        print(
-                            f"[DEBUG] Client {self.id} B_parallel.t(): {B_parallel.t().shape}"
-                        )
-                        print(
-                            f"[DEBUG] Client {self.id} g_k_subset.unsqueeze(-1): {g_k_subset.unsqueeze(-1).shape}"
-                        )
-                        # Fall back to zero parallel gradient
-                        g_k_parallel = torch.zeros_like(g_k_prime)
-                        raise e
+                    # Create full parallel gradient by padding with zeros
+                    g_k_parallel = torch.zeros_like(g_k_prime)
+                    g_k_parallel[: B_parallel.size(0)] = g_k_parallel_subset
 
                 else:
                     # Server basis is larger than gradient - use gradient-sized portion of basis
@@ -753,11 +722,16 @@ class clientAPOP(Client):
 
         if mat_list:
             # Use adaptive threshold like original GPM (0.97 + task_id * 0.003)
+            # ORIGINAL: Creates array of thresholds, one per layer
+            # Since we have 19 layers now (vs original 5), create array for all layers
+            num_layers = len(mat_list)
+            base_thresholds = np.array([self.base_threshold] * num_layers)
+            task_increments = np.array([self.threshold_increment] * num_layers)
             adaptive_threshold = (
-                self.base_threshold + self.current_task_idx * self.threshold_increment
+                base_thresholds + self.current_task_idx * task_increments
             )
             print(
-                f'[GPM] Client {self.id} Using adaptive threshold: {adaptive_threshold:.4f} for task {self.current_task_idx}'
+                f'[GPM] Client {self.id} Using adaptive thresholds: {adaptive_threshold} for task {self.current_task_idx}'
             )
 
             # Update GPM and get unfiltered U for knowledge distillation
@@ -1016,10 +990,18 @@ class clientAPOP(Client):
                     # CRITICAL: Use original sliding window approach like main_cifar100.py
                     batch_size, channels, height, width = act.shape
 
-                    # Use proper batch size like original (adapted for memory)
-                    effective_batch = min(
-                        batch_size, 25
-                    )  # Reduced from original's 125 for memory
+                    # ORIGINAL GPM: Use layer-specific batch sizes like original
+                    # Original used batch_list=[2*12,100,100,125,125] for 5 layers
+                    # Adapt for our 19 layers: smaller batches for conv, larger for FC
+                    layer_idx = len(mat_list)  # Current layer index
+                    if layer_idx < 10:  # Early conv layers (input, conv1, early blocks)
+                        effective_batch = min(batch_size, 24)  # 2*12 like original
+                    elif layer_idx < 17:  # Mid conv layers
+                        effective_batch = min(batch_size, 50)  # Intermediate size
+                    else:  # Later conv layers and FC
+                        effective_batch = min(
+                            batch_size, 125
+                        )  # Full size like original
 
                     # Original sliding window extraction approach
                     kernel_size = min(3, height, width)  # Adaptive kernel size
@@ -1110,7 +1092,11 @@ class clientAPOP(Client):
                 # Apply threshold criteria (Eq-5 from original)
                 sval_total = (S**2).sum()
                 sval_ratio = (S**2) / sval_total
-                r = np.sum(np.cumsum(sval_ratio) < threshold)
+                # ORIGINAL: Use layer-specific threshold
+                layer_threshold = (
+                    threshold[i] if hasattr(threshold, '__len__') else threshold
+                )
+                r = np.sum(np.cumsum(sval_ratio) < layer_threshold)
                 # ORIGINAL: Allow r=0 like original GPM, but handle empty case
 
                 if r > 0:
@@ -1153,7 +1139,11 @@ class clientAPOP(Client):
 
                 r = 0
                 for ii in range(sval_ratio.shape[0]):
-                    if accumulated_sval < threshold:
+                    # ORIGINAL: Use layer-specific threshold like original implementation
+                    layer_threshold = (
+                        threshold[i] if hasattr(threshold, '__len__') else threshold
+                    )
+                    if accumulated_sval < layer_threshold:
                         accumulated_sval += sval_ratio[ii]
                         r += 1
                     else:
@@ -1223,19 +1213,12 @@ class clientAPOP(Client):
             if not all_basis:
                 return None
 
-            # Handle variable-sized vectors by padding to maximum size
-            max_length = max(len(basis) for basis in all_basis)
-            padded_basis = []
-            for basis in all_basis:
-                if len(basis) < max_length:
-                    # Pad with zeros to match maximum length
-                    padded = np.pad(basis, (0, max_length - len(basis)))
-                    padded_basis.append(padded)
-                else:
-                    padded_basis.append(basis)
+            # ORIGINAL GPM APPROACH: Process layers independently, no padding needed
+            # Just concatenate all flattened bases directly (simpler and more faithful)
+            concatenated_basis = np.concatenate(all_basis)
 
-            # Stack to form knowledge matrix
-            knowledge_matrix = np.column_stack(padded_basis)  # [max_params, num_layers]
+            # Reshape for SVD (treat as single vector)
+            knowledge_matrix = concatenated_basis.reshape(-1, 1)
 
             # Apply the same SVD filtering we were using
             U, S, Vt = np.linalg.svd(knowledge_matrix, full_matrices=False)

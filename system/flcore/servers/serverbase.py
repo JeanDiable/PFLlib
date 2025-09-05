@@ -12,6 +12,7 @@ from utils.dlg import DLG
 # Optional wandb import
 try:
     import wandb
+
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
@@ -96,6 +97,8 @@ class Server(object):
             self.task_performance_history = (
                 {}
             )  # {client_id: {task_id: [accuracies_over_rounds]}}
+            # CRITICAL FIX: Store task-end accuracies when tasks actually complete
+            self.task_end_accuracies = {}  # {client_id: {task_id: task_end_accuracy}}
             self.til_metrics = {'acc': [], 'fgt': []}
 
         # Wandb logging support
@@ -926,6 +929,21 @@ class Server(object):
                         task_accuracy
                     )
 
+                    # CRITICAL FIX: Record task-end accuracy when task just completed
+                    if self.cil_rounds_per_class > 0:
+                        task_end_round = (task_id + 1) * self.cil_rounds_per_class - 1
+                        # Check if this is the first evaluation after task completion
+                        if current_round >= task_end_round and (
+                            client_id not in self.task_end_accuracies
+                            or task_id not in self.task_end_accuracies[client_id]
+                        ):
+                            if client_id not in self.task_end_accuracies:
+                                self.task_end_accuracies[client_id] = {}
+                            self.task_end_accuracies[client_id][task_id] = task_accuracy
+                            print(
+                                f"[TIL] 📝 Client {client_id} Task {task_id} TASK-END accuracy recorded: {task_accuracy:.4f} at round {current_round}"
+                            )
+
                     print(
                         f"[TIL] Client {client_id} Task {task_id} (Classes {task_classes}): {task_accuracy:.4f}"
                     )
@@ -935,7 +953,7 @@ class Server(object):
         if self.task_performance_history:
             overall_acc = 0.0
             total_tasks = 0
-            
+
             for client_id, task_history in self.task_performance_history.items():
                 client_task_metrics[client_id] = {}
                 for task_id, accuracies in task_history.items():
@@ -944,10 +962,10 @@ class Server(object):
                         overall_acc += current_acc
                         total_tasks += 1
                         client_task_metrics[client_id][task_id] = current_acc
-                        
+
             overall_acc = overall_acc / total_tasks if total_tasks > 0 else 0.0
             self.rs_test_acc.append(overall_acc)
-            
+
             # Log to wandb
             self._log_til_task_metrics_to_wandb(current_round, client_task_metrics)
             self._log_evaluation_metrics_to_wandb(current_round, overall_acc)
@@ -966,36 +984,47 @@ class Server(object):
 
             # Get client's task sequence to determine task end points
             client_task_sequence = self.client_task_sequences.get(client_id, [])
-            
+
+            # CRITICAL FIX: Find the last task for this client to exclude from FGT
+            max_task_id = max(task_history.keys()) if task_history else -1
+
             for task_id, accuracies in task_history.items():
                 if accuracies:
                     final_acc = accuracies[-1]  # Final accuracy (at end of training)
-                    
-                    # Calculate forgetting: accuracy at end of task training vs final accuracy
-                    if self.cil_rounds_per_class > 0 and task_id < len(client_task_sequence):
-                        # Find the accuracy at the end of this task's training period
-                        task_end_round = (task_id + 1) * self.cil_rounds_per_class - 1
-                        # Find the closest recorded round to task end
-                        task_end_acc = final_acc  # Default to final if not found
-                        
-                        # Look for accuracy recorded at or just after task end
-                        for round_idx, acc in enumerate(accuracies):
-                            # Round index corresponds to evaluation rounds
-                            eval_round = round_idx * self.eval_gap if hasattr(self, 'eval_gap') and self.eval_gap > 0 else round_idx
-                            if eval_round >= task_end_round:
-                                task_end_acc = acc
-                                break
-                        
-                        forgetting = task_end_acc - final_acc  # Positive = forgetting, Negative = improvement
+
+                    # CRITICAL FIX: Exclude last task from FGT calculation (it can't be forgotten yet)
+                    if task_id == max_task_id:
+                        # Last task: include in ACC but not in FGT
+                        task_end_acc = final_acc
+                        forgetting = 0.0  # Not included in FGT calculation
+                        include_in_fgt = False
+                    elif (
+                        client_id in self.task_end_accuracies
+                        and task_id in self.task_end_accuracies[client_id]
+                    ):
+                        # Use the stored task-end accuracy for completed tasks
+                        task_end_acc = self.task_end_accuracies[client_id][task_id]
+                        forgetting = (
+                            task_end_acc - final_acc
+                        )  # Positive = forgetting, Negative = improvement
+                        include_in_fgt = True
                     else:
-                        # Fallback: no forgetting for last task or if rounds per class not set
+                        # Fallback for tasks that haven't completed properly
+                        task_end_acc = final_acc
                         forgetting = 0.0
+                        include_in_fgt = False
 
                     client_task_accs.append(final_acc)
-                    client_task_fgts.append(forgetting)
+                    if include_in_fgt:
+                        client_task_fgts.append(forgetting)
 
+                    fgt_suffix = (
+                        " (excluded from FGT)"
+                        if not include_in_fgt and task_id == max_task_id
+                        else ""
+                    )
                     print(
-                        f"[TIL] Client {client_id} Task {task_id}: Final {final_acc:.4f}, Task-End {task_end_acc:.4f}, FGT {forgetting:.4f}"
+                        f"[TIL] Client {client_id} Task {task_id}: Final {final_acc:.4f}, Task-End {task_end_acc:.4f}, FGT {forgetting:.4f}{fgt_suffix}"
                     )
 
             if client_task_accs:
@@ -1010,7 +1039,9 @@ class Server(object):
 
         # Log final metrics to wandb
         if self.wandb_enable and self.wandb_run:
-            self._log_til_final_metrics_to_wandb(final_acc, final_fgt, client_accs, client_fgts)
+            self._log_til_final_metrics_to_wandb(
+                final_acc, final_fgt, client_accs, client_fgts
+            )
 
         return {'ACC': final_acc, 'FGT': final_fgt}
 
@@ -1034,23 +1065,27 @@ class Server(object):
                 'cil_rounds_per_class': getattr(args, 'cil_rounds_per_class', 0),
                 'num_classes': args.num_classes,
             }
-            
+
             # Add task sequence info
             if hasattr(self, 'client_task_sequences') and self.client_task_sequences:
                 config['num_clients_with_sequences'] = len(self.client_task_sequences)
-                config['avg_tasks_per_client'] = np.mean([len(seq) for seq in self.client_task_sequences.values()])
-            
-            project_name = getattr(args, 'wandb_project', 'federated-continual-learning')
-            
+                config['avg_tasks_per_client'] = np.mean(
+                    [len(seq) for seq in self.client_task_sequences.values()]
+                )
+
+            project_name = getattr(
+                args, 'wandb_project', 'federated-continual-learning'
+            )
+
             self.wandb_run = wandb.init(
                 project=project_name,
                 name=f"{args.algorithm}_{args.dataset}_{args.goal}",
                 config=config,
-                reinit=True
+                reinit=True,
             )
-            
+
             print(f"[WANDB] Initialized logging to project: {project_name}")
-            
+
         except Exception as e:
             print(f"[WANDB ERROR] Failed to initialize: {e}")
             self.wandb_enable = False
@@ -1059,11 +1094,11 @@ class Server(object):
         """Log training metrics to wandb."""
         if not self.wandb_enable or not self.wandb_run:
             return
-            
+
         metrics = {'round': round_num}
         if train_loss is not None:
             metrics['train/loss'] = train_loss
-            
+
         try:
             wandb.log(metrics)
         except Exception as e:
@@ -1073,13 +1108,13 @@ class Server(object):
         """Log evaluation metrics to wandb."""
         if not self.wandb_enable or not self.wandb_run:
             return
-            
+
         metrics = {'round': round_num}
         if accuracy is not None:
             metrics['eval/accuracy'] = accuracy
         if auc is not None:
             metrics['eval/auc'] = auc
-            
+
         try:
             wandb.log(metrics)
         except Exception as e:
@@ -1089,56 +1124,63 @@ class Server(object):
         """Log per-client per-task metrics to wandb for TIL."""
         if not self.wandb_enable or not self.wandb_run:
             return
-            
+
         try:
             metrics = {'round': round_num}
-            
+
             # Log individual client-task accuracies
             for client_id, task_metrics in client_task_metrics.items():
                 for task_id, accuracy in task_metrics.items():
                     metrics[f'til/client_{client_id}_task_{task_id}'] = accuracy
-                    
+
             # Log average metrics
-            all_accuracies = [acc for task_metrics in client_task_metrics.values() 
-                            for acc in task_metrics.values()]
+            all_accuracies = [
+                acc
+                for task_metrics in client_task_metrics.values()
+                for acc in task_metrics.values()
+            ]
             if all_accuracies:
                 metrics['til/avg_task_accuracy'] = np.mean(all_accuracies)
                 metrics['til/num_active_tasks'] = len(all_accuracies)
-                
+
             wandb.log(metrics)
         except Exception as e:
             print(f"[WANDB ERROR] Failed to log TIL task metrics: {e}")
 
-    def _log_til_final_metrics_to_wandb(self, final_acc, final_fgt, client_accs, client_fgts):
+    def _log_til_final_metrics_to_wandb(
+        self, final_acc, final_fgt, client_accs, client_fgts
+    ):
         """Log final TIL metrics to wandb."""
         if not self.wandb_enable or not self.wandb_run:
             return
-            
+
         try:
             metrics = {
                 'final/til_acc': final_acc,
                 'final/til_fgt': final_fgt,
             }
-            
+
             # Log per-client metrics
             for i, (acc, fgt) in enumerate(zip(client_accs, client_fgts)):
                 metrics[f'final/client_{i}_acc'] = acc
                 metrics[f'final/client_{i}_fgt'] = fgt
-                
+
             # Log distribution statistics
             if client_accs:
                 metrics['final/acc_std'] = np.std(client_accs)
                 metrics['final/acc_min'] = np.min(client_accs)
                 metrics['final/acc_max'] = np.max(client_accs)
-                
+
             if client_fgts:
                 metrics['final/fgt_std'] = np.std(client_fgts)
                 metrics['final/fgt_min'] = np.min(client_fgts)
                 metrics['final/fgt_max'] = np.max(client_fgts)
-                
+
             wandb.log(metrics)
-            print(f"[WANDB] Logged final TIL metrics: ACC={final_acc:.4f}, FGT={final_fgt:.4f}")
-            
+            print(
+                f"[WANDB] Logged final TIL metrics: ACC={final_acc:.4f}, FGT={final_fgt:.4f}"
+            )
+
         except Exception as e:
             print(f"[WANDB ERROR] Failed to log final TIL metrics: {e}")
 
@@ -1146,12 +1188,12 @@ class Server(object):
         """Collect training losses from selected clients for logging."""
         if not hasattr(self, 'selected_clients') or not self.selected_clients:
             return None
-            
+
         losses = []
         for client in self.selected_clients:
             if hasattr(client, 'last_train_loss'):
                 losses.append(client.last_train_loss)
-                
+
         return np.mean(losses) if losses else None
 
     def _finish_wandb(self):
