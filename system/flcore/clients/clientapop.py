@@ -24,17 +24,15 @@ class clientAPOP(Client):
         )  # Minimum rounds before adaptation check
 
         # Client state
-        self.past_bases = None  # B_k^past - updated bases from server query
+        self.feature_list = []  # GPM feature list (orthogonal subspaces for each layer)
         self.current_task_idx = 0
         self.is_adapted = False
         self.initial_signature = None
         self.parallel_basis = None  # B_∥^t - retrieved similar task basis
         self.similarity_retrieved = 0.0  # sim_retrieved
 
-        # Store past task signatures for server queries
-        self.past_task_signatures = (
-            {}
-        )  # {task_id: signature} for querying updated bases
+        # GPM parameters
+        self.energy_threshold = 0.985  # e_th - preservation threshold for GPM
 
         # Adaptation tracking
         self.adaptation_round_count = 0  # Track adaptation progress
@@ -104,7 +102,7 @@ class clientAPOP(Client):
                 # First task should be completely free training
                 current_task_idx = getattr(self, 'current_task_idx', 0)
                 if current_task_idx > 0 or (
-                    hasattr(self, 'past_bases') and self.past_bases is not None
+                    hasattr(self, 'feature_list') and len(self.feature_list) > 0
                 ):
                     self._apply_apop_gradient_modulation()
 
@@ -138,22 +136,25 @@ class clientAPOP(Client):
             self._store_metrics_for_server(
                 {
                     'task_progression/current_task': current_task_idx,
-                    'task_progression/total_past_tasks': len(self.past_task_signatures),
+                    'task_progression/total_past_tasks': 0,
                 }
             )
         else:
             print(
-                f"[APOP] Client {self.id} 🔄 STARTING TASK {current_task_idx} (APOP Mode)"
+                f"[APOP] Client {self.id} 🔄 STARTING TASK {current_task_idx} (GPM Mode)"
             )
-            print(
-                f"[APOP] Client {self.id} 📋 Will query server for updated past bases using stored signatures..."
-            )
+            if self.feature_list:
+                total_dims = sum([f.shape[1] for f in self.feature_list])
+                print(
+                    f"[APOP] Client {self.id} 📋 Using GPM feature list for forgetting prevention, total dims: {total_dims}"
+                )
             # Log key task initiation metrics
             self._store_metrics_for_server(
                 {
                     'task_progression/current_task': current_task_idx,
-                    'task_progression/total_past_tasks': len(self.past_task_signatures),
-                    'apop_mode/orthogonal_protection_active': True,
+                    'task_progression/total_past_tasks': current_task_idx,
+                    'apop_mode/orthogonal_protection_active': len(self.feature_list)
+                    > 0,
                 }
             )
 
@@ -171,14 +172,7 @@ class clientAPOP(Client):
             'num_rounds', 0
         )
 
-        # Query server for updated past bases using stored signatures
-        if self.current_task_idx > 0 and self.past_task_signatures:
-            print(
-                f"[APOP] Client {self.id} 🔍 Querying Server for Updated Past Bases using {len(self.past_task_signatures)} signatures..."
-            )
-            self._query_past_bases_from_server()
-        else:
-            self.past_bases = None
+        # No server querying needed - using client's own orthogonal basis
 
         print(
             f"[APOP] Client {self.id} ✅ Task {current_task_idx} Initialized - Entering Adaptation Period (min {self.min_adaptation_rounds} rounds)"
@@ -362,9 +356,9 @@ class clientAPOP(Client):
                 if param.grad is not None:
                     param.grad.data.clamp_(-1e6, 1e6)  # Clip to reasonable range
 
-        # Step 1: Orthogonal projection to prevent forgetting
-        if self.past_bases is not None:
-            self._apply_orthogonal_projection()
+        # Step 1: GPM orthogonal projection to prevent forgetting
+        if self.feature_list:
+            self._apply_gmp_projection()
 
         # Step 2: Parallel projection for knowledge transfer (if adapted)
         if self.is_adapted and self.parallel_basis is not None:
@@ -372,7 +366,7 @@ class clientAPOP(Client):
 
         # Log only important state changes
         current_state = (
-            self.past_bases is not None,
+            len(self.feature_list) > 0,
             self.is_adapted,
             self.parallel_basis is not None,
         )
@@ -405,7 +399,7 @@ class clientAPOP(Client):
                     abs(final_grad_norm - original_grad_norm) / original_grad_norm
                 )
                 if gradient_modulation_effect > 0.1:  # Only log significant changes
-                    dual_mode_active = (self.past_bases is not None) and (
+                    dual_mode_active = (len(self.feature_list) > 0) and (
                         self.parallel_basis is not None
                     )
                     self._store_metrics_for_server(
@@ -414,73 +408,6 @@ class clientAPOP(Client):
                             'dual_subspace_modulation/gradient_modulation_strength': gradient_modulation_effect,
                         }
                     )
-
-    def _apply_orthogonal_projection(self):
-        """Project gradients orthogonal to past task subspace to prevent forgetting.
-
-        g_k' ← g_k - B_k^past (B_k^past)^T g_k
-        """
-        try:
-            # Collect current gradients
-            gradients = []
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    gradients.append(param.grad.view(-1))
-
-            if not gradients:
-                return
-
-            g_k = torch.cat(gradients)
-            original_grad_norm = torch.norm(g_k).item()
-
-            # Convert past_bases to tensor if needed
-            if isinstance(self.past_bases, np.ndarray):
-                B_past = torch.tensor(
-                    self.past_bases, dtype=g_k.dtype, device=g_k.device
-                )
-            else:
-                B_past = self.past_bases.to(g_k.device)
-
-            # Ensure dimensions are compatible
-            if B_past.size(0) != g_k.size(0):
-                print(
-                    f"[APOP] ERROR: Dimension mismatch in orthogonal projection! Client {self.id}: B_past {B_past.shape}, g_k {g_k.shape}"
-                )
-                return
-
-            # Orthogonal projection: g_k' = g_k - B_past B_past^T g_k
-            BT_g = torch.matmul(B_past.t(), g_k.unsqueeze(-1)).squeeze(-1)
-            projection = torch.matmul(B_past, BT_g.unsqueeze(-1)).squeeze(-1)
-            g_k_prime = g_k - projection
-
-            # Log projection effectiveness to wandb
-            projection_norm = torch.norm(projection).item()
-            final_grad_norm = torch.norm(g_k_prime).item()
-            if original_grad_norm > 0:
-                # Core APOP Innovation: Catastrophic Forgetting Prevention
-                forgetting_prevention_ratio = projection_norm / original_grad_norm
-                gradient_retention_ratio = final_grad_norm / original_grad_norm
-                self._store_metrics_for_server(
-                    {
-                        'forgetting_prevention/catastrophic_forgetting_blocked': forgetting_prevention_ratio,
-                        'forgetting_prevention/learning_capacity_retained': gradient_retention_ratio,
-                    }
-                )
-
-            # Redistribute modulated gradients back to parameters
-            start_idx = 0
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    num_elements = param.grad.numel()
-                    param.grad = g_k_prime[start_idx : start_idx + num_elements].view(
-                        param.grad.shape
-                    )
-                    start_idx += num_elements
-
-        except Exception as e:
-            print(
-                f"[APOP] ERROR: Orthogonal projection failed for client {self.id}: {e}"
-            )
 
     def _apply_parallel_projection(self):
         """Apply parallel projection to guide learning with transferred knowledge.
@@ -525,30 +452,26 @@ class clientAPOP(Client):
             BT_g = torch.matmul(B_parallel.t(), g_k_prime.unsqueeze(-1)).squeeze(-1)
             g_k_parallel = torch.matmul(B_parallel, BT_g.unsqueeze(-1)).squeeze(-1)
 
-            # Orthogonal component: g_k^⊥ = g_k' - g_k^∥
-            g_k_orthogonal = g_k_prime - g_k_parallel
-
-            # Final modulated gradient: g_k'' = (1+α) g_k^∥ + g_k^⊥
-            g_k_final = alpha * g_k_parallel + g_k_orthogonal
+            # Keep GPM orthogonal as main body, add parallel term for guidance
+            # Final modulated gradient: g_k'' = g_k' + α * g_k^∥ (no orthogonal subtraction)
+            g_k_final = g_k_prime + alpha * g_k_parallel
             final_grad_norm = torch.norm(g_k_final).item()
 
             # Log transfer effectiveness to wandb
             parallel_norm = torch.norm(g_k_parallel).item()
-            orthogonal_norm = torch.norm(g_k_orthogonal).item()
             if input_grad_norm > 0:
                 # Core APOP Innovation: Intelligent Knowledge Transfer
                 transfer_boost = final_grad_norm / input_grad_norm
-                knowledge_utilization = (
-                    parallel_norm / (parallel_norm + orthogonal_norm)
-                    if (parallel_norm + orthogonal_norm) > 0
-                    else 0
+                parallel_contribution = (
+                    parallel_norm / input_grad_norm if input_grad_norm > 0 else 0
                 )
+
                 self._store_metrics_for_server(
                     {
                         'knowledge_transfer/adaptive_transfer_gain': alpha,
                         'knowledge_transfer/similarity_based_matching': self.similarity_retrieved,
                         'knowledge_transfer/learning_acceleration': transfer_boost,
-                        'knowledge_transfer/knowledge_utilization_ratio': knowledge_utilization,
+                        'knowledge_transfer/parallel_guidance_ratio': parallel_contribution,
                     }
                 )
 
@@ -649,15 +572,6 @@ class clientAPOP(Client):
         self.needs_knowledge_transfer = True
         self.current_task_signature = task_signature
 
-    def _query_past_bases_from_server(self):
-        """Query server for updated past bases using stored task signatures."""
-        # This will be called by the server during client setup
-        # The server will use self.past_task_signatures to retrieve updated bases
-        self.needs_past_bases_query = True
-        print(
-            f"[APOP] Client {self.id} 📤 Requesting updated bases for {len(self.past_task_signatures)} past tasks"
-        )
-
     def _compute_similarity(self, sig1, sig2):
         """Compute enhanced similarity between two task signatures.
 
@@ -747,129 +661,6 @@ class clientAPOP(Client):
             filtered_data, batch_size=batch_size, drop_last=False, shuffle=False
         )
 
-    def distill_knowledge(self, trainloader):
-        """Distill knowledge basis from current task for contribution to server.
-
-        This creates a low-rank representation of the gradient subspace for the current task.
-        """
-        print(
-            f"[APOP] Client {self.id} distilling knowledge for task {self.current_task_idx}"
-        )
-
-        self.model.eval()
-        gradient_samples = []
-
-        try:
-            # Collect gradient samples from multiple batches
-            sample_count = 0
-            max_samples = min(10, len(trainloader))  # Limit to avoid memory issues
-
-            for x, y in trainloader:
-                if sample_count >= max_samples:
-                    break
-
-                if type(x) == type([]):
-                    x[0] = x[0].to(self.device)
-                else:
-                    x = x.to(self.device)
-                y = y.to(self.device)
-
-                # Compute gradients
-                self.model.zero_grad()
-                output = self.model(x)
-                if getattr(self, 'til_enable', False):
-                    loss = self._mask_loss_for_training(output, y)
-                else:
-                    loss = self.loss(output, y)
-                loss.backward()
-
-                # Collect gradients
-                gradients = []
-                for param in self.model.parameters():
-                    if param.grad is not None:
-                        gradients.append(param.grad.view(-1))
-
-                if gradients:
-                    gradient_vector = torch.cat(gradients).detach().cpu().numpy()
-                    gradient_samples.append(gradient_vector)
-                    sample_count += 1
-
-            if not gradient_samples:
-                print(
-                    f"[APOP] Warning: No gradient samples collected for client {self.id}"
-                )
-                return np.random.randn(100, self.subspace_dim) / 10  # Fallback
-
-            # Create gradient matrix and perform SVD
-            gradient_matrix = np.array(gradient_samples).T  # [param_dim, sample_dim]
-
-            # Perform SVD to extract knowledge basis with proper filtering
-            U, S, Vt = np.linalg.svd(gradient_matrix, full_matrices=False)
-
-            # Keep only truly important components using SVD analysis
-            # Use spectral gap detection and cumulative energy thresholds
-            cumulative_energy_threshold = (
-                0.85  # Keep components explaining 85% of variance (very aggressive)
-            )
-            spectral_gap_ratio = (
-                0.2  # Very aggressive gap detection for client distillation
-            )
-
-            if len(S) > 0:
-                # Method 1: Cumulative energy (most important)
-                total_energy = np.sum(S**2)
-                cumulative_energy = np.cumsum(S**2) / total_energy
-                energy_rank = (
-                    np.sum(cumulative_energy < cumulative_energy_threshold) + 1
-                )
-
-                # Method 2: Spectral gap detection
-                if len(S) > 1:
-                    ratios = S[1:] / S[:-1]  # Ratio of consecutive singular values
-                    gap_indices = np.where(ratios < spectral_gap_ratio)[0]
-                    spectral_rank = (
-                        gap_indices[0] + 1 if len(gap_indices) > 0 else len(S)
-                    )
-                else:
-                    spectral_rank = 1
-
-                # Use the most conservative (smallest) rank for distillation
-                effective_rank = min(
-                    energy_rank, spectral_rank, self.subspace_dim // 4
-                )  # Very aggressive for distillation
-            else:
-                effective_rank = 0
-
-            target_rank = max(1, min(effective_rank, self.subspace_dim, U.shape[1]))
-
-            print(
-                f"[APOP] Client {self.id} SVD analysis: energy_rank={energy_rank}, spectral_rank={spectral_rank}"
-            )
-            print(
-                f"[APOP] Client {self.id} cumulative energy (85%): {cumulative_energy[energy_rank-1]:.4f}"
-            )
-
-            # Extract top-r basis vectors (only the most important directions)
-            knowledge_basis = U[:, :target_rank]
-
-            print(
-                f"[APOP] Client {self.id} distilled knowledge basis: "
-                f"shape={knowledge_basis.shape}, effective_rank={effective_rank}, target_rank={target_rank}"
-            )
-            print(f"[APOP] Client {self.id} singular values (top 10): {S[:10]}")
-
-            return knowledge_basis
-
-        except Exception as e:
-            print(
-                f"[APOP] Warning: Knowledge distillation failed for client {self.id}: {e}"
-            )
-            # Fallback: random basis
-            param_count = sum(p.numel() for p in self.model.parameters())
-            return np.random.randn(param_count, self.subspace_dim) / 10
-        finally:
-            self.model.train()
-
     def receive_knowledge_transfer(self, parallel_basis, similarity_score):
         """Receive knowledge transfer from server."""
         self.parallel_basis = parallel_basis
@@ -891,37 +682,46 @@ class clientAPOP(Client):
         )
 
     def finish_current_task(self, trainloader):
-        """Complete current task and prepare for next task."""
+        """Complete current task and prepare for next task using GPM method."""
         print(
-            f"[APOP] Client {self.id} 🎓 TASK {self.current_task_idx} COMPLETED! Contributing knowledge to server"
+            f"[APOP] Client {self.id} 🎓 TASK {self.current_task_idx} COMPLETED! Extending orthogonal space using GPM"
         )
 
-        # Compute final task signature and store it for future queries (deterministic)
-        final_signature = self._compute_task_signature(trainloader, fixed_seed=True)
-        self.past_task_signatures[self.current_task_idx] = final_signature
-        print(
-            f"[APOP] Client {self.id} 💾 Stored signature for Task {self.current_task_idx} (total: {len(self.past_task_signatures)} past signatures)"
-        )
+        # Memory update using GPM (following original implementation)
+        mat_list = self._get_representation_matrix(trainloader)
 
-        # Distill knowledge for server contribution
-        knowledge_basis = self.distill_knowledge(trainloader)
-
-        # APOP Innovation: Massive SVD-Based Knowledge Compression
-        if knowledge_basis is not None:
-            total_model_params = knowledge_basis.shape[0]
-            compressed_dimensions = knowledge_basis.shape[1]
-            compression_ratio = total_model_params / compressed_dimensions
-            compression_efficiency = 1.0 - (compressed_dimensions / total_model_params)
-
-            self._store_metrics_for_server(
-                {
-                    'knowledge_compression/total_model_parameters': total_model_params,
-                    'knowledge_compression/compressed_to_dimensions': compressed_dimensions,
-                    'knowledge_compression/compression_ratio': compression_ratio,
-                    'knowledge_compression/space_efficiency': compression_efficiency,
-                    'task_progression/tasks_completed': self.current_task_idx + 1,
-                }
+        if mat_list:
+            # Update GPM and get unfiltered U for knowledge distillation
+            self.feature_list, unfiltered_U_list = self._update_gpm(
+                mat_list,
+                self.energy_threshold,
+                self.feature_list if self.feature_list else None,
             )
+
+            # Invalidate cached projection matrices since feature_list was updated
+            self._cached_projection_matrices = None
+
+            # Log GPM update metrics
+            if self.feature_list:
+                total_dims = sum([f.shape[1] for f in self.feature_list])
+                total_params = sum([f.shape[0] for f in self.feature_list])
+                compression_ratio = total_params / max(total_dims, 1)
+
+                print(
+                    f"[APOP] Client {self.id} 📐 Updated GPM feature list, total dims: {total_dims}"
+                )
+
+                self._store_metrics_for_server(
+                    {
+                        'orthogonal_space/basis_dimensions': total_dims,
+                        'orthogonal_space/total_parameters': total_params,
+                        'orthogonal_space/compression_ratio': compression_ratio,
+                        'task_progression/tasks_completed': self.current_task_idx + 1,
+                    }
+                )
+        else:
+            print(f"[APOP] Client {self.id} ⚠️ No representation matrix obtained")
+            unfiltered_U_list = []
 
         # Reset task state
         self.current_task_idx += 1
@@ -931,23 +731,451 @@ class clientAPOP(Client):
         if hasattr(self, '_task_initialized'):
             delattr(self, '_task_initialized')
 
+        # Compute final task signature and distill knowledge for server (parallel training)
+        final_signature = self._compute_task_signature(trainloader, fixed_seed=True)
+        knowledge_basis = self._distill_knowledge_from_gmp_basis(unfiltered_U_list)
+
         return final_signature, knowledge_basis
 
-    def set_past_bases(self, past_bases):
-        """Set updated past task bases received from server query."""
-        self.past_bases = past_bases
-        if past_bases is not None:
+    # Removed set_past_bases method - no longer needed with GPM approach
+
+    def _get_representation_matrix(self, trainloader):
+        """Get representation matrix following original GPM implementation.
+
+        Adapted from original GPM paper implementation for ResNet.
+        Collects activations by forward pass and extracts features properly.
+
+        Returns:
+            list: List of representation matrices for each layer
+        """
+        self.model.eval()
+
+        try:
+            # Collect activations by forward pass (following original GPM)
+            # Take random samples from training data
+            all_data = []
+            all_targets = []
+            for x, y in trainloader:
+                if type(x) == type([]):
+                    x = x[0]
+                all_data.append(x)
+                all_targets.append(y)
+                if len(all_data) * x.size(0) >= 150:  # Collect enough samples
+                    break
+
+            if not all_data:
+                return []
+
+            all_x = torch.cat(all_data, dim=0)
+            all_y = torch.cat(all_targets, dim=0)
+
+            # Take 125 random samples (following original)
+            r = np.arange(all_x.size(0))
+            np.random.shuffle(r)
+            num_samples = min(125, len(r))
+            r = r[:num_samples]
+
+            example_data = all_x[r].to(self.device)
+            example_targets = all_y[r].to(self.device)
+
+            # Store activations during forward pass
+            activations = {}
+
+            def save_activation(name):
+                def hook(model, input, output):
+                    activations[name] = output.detach()
+
+                return hook
+
+            # Get underlying model
+            base_model = getattr(self.model, 'base', self.model)
+
+            # Register hooks for key layers
+            hooks = []
+            # Conv layers
+            hooks.append(
+                base_model.layer1.register_forward_hook(save_activation('layer1'))
+            )
+            hooks.append(
+                base_model.layer2.register_forward_hook(save_activation('layer2'))
+            )
+            hooks.append(
+                base_model.layer3.register_forward_hook(save_activation('layer3'))
+            )
+            # Final conv layer
+            hooks.append(
+                base_model.layer4.register_forward_hook(save_activation('layer4'))
+            )
+            # FC layer (avgpool output)
+            hooks.append(
+                base_model.avgpool.register_forward_hook(save_activation('avgpool'))
+            )
+
+            # Forward pass to collect activations
+            with torch.no_grad():
+                _ = self.model(example_data)
+
+            # Remove hooks
+            for hook in hooks:
+                hook.remove()
+
+            # Process activations to create representation matrices
+            mat_list = []
+            layer_names = ['layer1', 'layer2', 'layer3', 'layer4', 'avgpool']
+
+            for i, layer_name in enumerate(layer_names):
+                if layer_name not in activations:
+                    continue
+
+                act = activations[layer_name].cpu().numpy()
+
+                if len(act.shape) == 4:  # Convolutional layers
+                    # For conv layers: extract sliding window patches (adapted from original)
+                    batch_size, channels, height, width = act.shape
+
+                    # Use smaller batch size for conv layers to avoid memory issues
+                    effective_batch = min(batch_size, 25)  # Reduced from 125
+
+                    # For conv layers, we flatten spatial dimensions and treat as features
+                    # This is a simplified version of the original sliding window approach
+                    mat = (
+                        act[:effective_batch]
+                        .reshape(effective_batch, channels * height * width)
+                        .T
+                    )
+                    mat_list.append(mat)
+
+                else:  # Fully connected layers
+                    # For FC layers: transpose activation (following original)
+                    effective_batch = min(act.shape[0], 125)
+                    activation = act[:effective_batch].T  # [features, batch]
+                    mat_list.append(activation)
+
+            print(f'[GPM] Client {self.id} Representation Matrix')
+            print('-' * 30)
+            for i, mat in enumerate(mat_list):
+                print(f'Layer {i+1} : {mat.shape}')
+            print('-' * 30)
+
+            return mat_list
+
+        except Exception as e:
+            print(f"[GPM] Client {self.id} ERROR in representation matrix: {e}")
+            return []
+        finally:
+            self.model.train()
+
+    def _update_gpm(self, mat_list, threshold, feature_list=None):
+        """Update GPM following original implementation.
+
+        Args:
+            mat_list: List of representation matrices for each layer
+            threshold: Threshold for each layer (we'll use e_th for all)
+            feature_list: Existing feature list (None for first task)
+
+        Returns:
+            tuple: (updated_feature_list, unfiltered_U_list_for_knowledge_distillation)
+        """
+        print(f'[GPM] Client {self.id} Threshold: {threshold}')
+
+        if feature_list is None:
+            feature_list = []
+
+        updated_feature_list = []
+        unfiltered_U_list = []  # For knowledge distillation
+
+        if not feature_list:  # First task
+            print(f'[GPM] Client {self.id} First task - initial GPM setup')
+            for i in range(len(mat_list)):
+                activation = mat_list[i]
+                U, S, Vh = np.linalg.svd(activation, full_matrices=False)
+
+                # Store unfiltered U for knowledge distillation
+                unfiltered_U_list.append(U)
+
+                # Apply threshold criteria (Eq-5 from original)
+                sval_total = (S**2).sum()
+                sval_ratio = (S**2) / sval_total
+                r = np.sum(np.cumsum(sval_ratio) < threshold)
+                r = max(1, r)  # Ensure at least 1 component
+
+                updated_feature_list.append(U[:, :r])
+                print(
+                    f'[GPM] Client {self.id} Layer {i+1}: Initial basis {U.shape} -> {U[:, :r].shape}'
+                )
+
+        else:  # Subsequent tasks
+            print(f'[GPM] Client {self.id} Subsequent task - updating GPM')
+            for i in range(min(len(mat_list), len(feature_list))):
+                activation = mat_list[i]
+
+                # First SVD to get U1 (for knowledge distillation)
+                U1, S1, Vh1 = np.linalg.svd(activation, full_matrices=False)
+                unfiltered_U_list.append(
+                    U1
+                )  # Store unfiltered U for knowledge distillation
+
+                sval_total = (S1**2).sum()
+
+                # Projected Representation (Eq-8 from original)
+                act_hat = activation - np.dot(
+                    np.dot(feature_list[i], feature_list[i].transpose()), activation
+                )
+
+                # SVD on residual
+                U, S, Vh = np.linalg.svd(act_hat, full_matrices=False)
+
+                # Criteria (Eq-9 from original)
+                sval_hat = (S**2).sum()
+                sval_ratio = (S**2) / sval_total
+                accumulated_sval = (sval_total - sval_hat) / sval_total
+
+                r = 0
+                for ii in range(sval_ratio.shape[0]):
+                    if accumulated_sval < threshold:
+                        accumulated_sval += sval_ratio[ii]
+                        r += 1
+                    else:
+                        break
+
+                if r == 0:
+                    print(f'[GPM] Client {self.id} Skip updating GPM for layer: {i+1}')
+                    updated_feature_list.append(feature_list[i])
+                    continue
+
+                # Update GPM by concatenation (following original)
+                Ui = np.hstack((feature_list[i], U[:, :r]))
+
+                # Prevent over-parameterization (following original)
+                if Ui.shape[1] > Ui.shape[0]:
+                    updated_feature_list.append(Ui[:, : Ui.shape[0]])
+                else:
+                    updated_feature_list.append(Ui)
+
+                print(
+                    f'[GPM] Client {self.id} Layer {i+1}: Updated basis from {feature_list[i].shape} to {updated_feature_list[-1].shape}'
+                )
+
+        # Print summary (following original)
+        print('-' * 40)
+        print(f'[GPM] Client {self.id} Gradient Constraints Summary')
+        print('-' * 40)
+        for i in range(len(updated_feature_list)):
             print(
-                f"[APOP] Client {self.id} 📚 Updated Past Bases Received! Shape: {past_bases.shape}, Enabling Orthogonal Projection"
+                f'Layer {i+1} : {updated_feature_list[i].shape[1]}/{updated_feature_list[i].shape[0]}'
             )
-            # APOP Innovation: Multi-Task Orthogonal Protection
-            self._store_metrics_for_server(
-                {
-                    'orthogonal_protection/past_knowledge_dimensions': past_bases.shape[
-                        1
-                    ],
-                    'orthogonal_protection/active_for_task': self.current_task_idx,
-                }
+        print('-' * 40)
+
+        return updated_feature_list, unfiltered_U_list
+
+    def _distill_knowledge_from_gmp_basis(self, unfiltered_U_list):
+        """Distill knowledge from GPM unfiltered U matrices for server knowledge base.
+
+        Uses the first U from SVD (before GPM filtering) as requested.
+        Applies the same SVD filtering strategy we were using for consistency.
+
+        Args:
+            unfiltered_U_list: List of unfiltered U matrices from GPM update
+
+        Returns:
+            numpy.ndarray: Knowledge basis for server
+        """
+        if not unfiltered_U_list:
+            print(
+                f"[APOP] Client {self.id} WARNING: No unfiltered U available for knowledge distillation"
             )
-        else:
-            print(f"[APOP] Client {self.id} ⚠️  No past bases available")
+            return None
+
+        try:
+            print(f"[APOP] Client {self.id} distilling knowledge from GPM basis")
+
+            # Concatenate all unfiltered U matrices (flatten layer information)
+            # This gives us the full gradient space representation before GPM filtering
+            all_basis = []
+            for layer_idx, U in enumerate(unfiltered_U_list):
+                if U.size > 0:
+                    # Simply flatten each layer's U matrix without arbitrary truncation
+                    # Let SVD filtering handle dimensionality reduction properly
+                    flattened = U.flatten()
+                    all_basis.append(flattened)
+
+            if not all_basis:
+                return None
+
+            # Handle variable-sized vectors by padding to maximum size
+            max_length = max(len(basis) for basis in all_basis)
+            padded_basis = []
+            for basis in all_basis:
+                if len(basis) < max_length:
+                    # Pad with zeros to match maximum length
+                    padded = np.pad(basis, (0, max_length - len(basis)))
+                    padded_basis.append(padded)
+                else:
+                    padded_basis.append(basis)
+
+            # Stack to form knowledge matrix
+            knowledge_matrix = np.column_stack(padded_basis)  # [max_params, num_layers]
+
+            # Apply the same SVD filtering we were using
+            U, S, Vt = np.linalg.svd(knowledge_matrix, full_matrices=False)
+
+            # Enhanced SVD filtering for knowledge distillation (conservative)
+            cumulative_energy_threshold = 0.85  # 85% energy retention
+            spectral_gap_ratio = 0.2  # 20% gap ratio
+
+            if len(S) > 0:
+                total_energy = np.sum(S**2)
+                cumulative_energy = np.cumsum(S**2) / total_energy
+                energy_rank = (
+                    np.sum(cumulative_energy < cumulative_energy_threshold) + 1
+                )
+
+                if len(S) > 1:
+                    ratios = S[1:] / S[:-1]
+                    gap_indices = np.where(ratios < spectral_gap_ratio)[0]
+                    spectral_rank = (
+                        gap_indices[0] + 1 if len(gap_indices) > 0 else len(S)
+                    )
+                else:
+                    spectral_rank = 1
+
+                # Conservative rank selection
+                effective_rank = min(energy_rank, spectral_rank, self.subspace_dim // 4)
+            else:
+                effective_rank = 0
+
+            target_rank = max(1, min(effective_rank, self.subspace_dim, U.shape[1]))
+
+            print(
+                f"[APOP] Client {self.id} SVD analysis: energy_rank={energy_rank}, spectral_rank={spectral_rank}"
+            )
+            print(
+                f"[APOP] Client {self.id} cumulative energy (85%): {cumulative_energy[energy_rank-1]:.4f}"
+            )
+
+            knowledge_basis = U[:, :target_rank]
+            print(
+                f"[APOP] Client {self.id} distilled knowledge basis: shape={knowledge_basis.shape}, effective_rank={effective_rank}, target_rank={target_rank}"
+            )
+            print(f"[APOP] Client {self.id} singular values (top 10): {S[:10]}")
+
+            return knowledge_basis
+
+        except Exception as e:
+            print(f"[APOP] Client {self.id} ERROR in knowledge distillation: {e}")
+            return None
+
+    def _precompute_projection_matrices(self):
+        """Pre-compute projection matrices P = UU^T for efficiency using GPU operations."""
+        if (
+            not hasattr(self, '_cached_projection_matrices')
+            or self._cached_projection_matrices is None
+        ):
+            self._cached_projection_matrices = []
+            for i, U in enumerate(self.feature_list):
+                # Convert numpy to GPU tensor first
+                U_tensor = torch.tensor(U, dtype=torch.float32, device=self.device)
+                # Compute P = UU^T on GPU
+                P = torch.mm(U_tensor, U_tensor.t())
+                self._cached_projection_matrices.append(P)
+
+            # Debug: Confirm GPU usage
+            if self._cached_projection_matrices:
+                sample_device = self._cached_projection_matrices[0].device
+                print(
+                    f"[GPM] Client {self.id} Pre-computed {len(self._cached_projection_matrices)} projection matrices on {sample_device}"
+                )
+
+    def _apply_gmp_projection(self):
+        """Apply GPM orthogonal projection following original implementation.
+
+        Projects gradients orthogonal to past task subspaces using precomputed
+        projection matrices from feature_list.
+        """
+        try:
+            # Pre-compute projection matrices if not cached
+            self._precompute_projection_matrices()
+            # Collect current gradients
+            gradients_per_layer = []
+            param_shapes = []
+            param_count = 0
+
+            # Map parameters to layers (simplified mapping for ResNet)
+            layer_param_map = []
+
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    param_shapes.append(param.size())
+
+                    # Map to layer index (simplified)
+                    if 'layer1' in name:
+                        layer_idx = 0
+                    elif 'layer2' in name:
+                        layer_idx = 1
+                    elif 'layer3' in name:
+                        layer_idx = 2
+                    elif 'layer4' in name:
+                        layer_idx = 3
+                    elif 'fc' in name or 'classifier' in name:
+                        layer_idx = min(4, len(self.feature_list) - 1)
+                    else:
+                        layer_idx = 0  # Default to first layer
+
+                    layer_param_map.append(layer_idx)
+                    param_count += 1
+
+            if param_count == 0:
+                return
+
+            # Apply projection layer by layer (following original GPM)
+            param_idx = 0
+            for name, param in self.model.named_parameters():
+                if param.grad is not None and param_idx < len(layer_param_map):
+                    layer_idx = layer_param_map[param_idx]
+
+                    # Skip if no feature matrix for this layer
+                    if layer_idx >= len(self.feature_list) or layer_idx >= len(
+                        self._cached_projection_matrices
+                    ):
+                        param_idx += 1
+                        continue
+
+                    # Use pre-computed projection matrix P = U * U^T for efficiency
+                    P = self._cached_projection_matrices[layer_idx]
+                    # Ensure correct dtype and device
+                    if P.dtype != param.grad.dtype or P.device != param.grad.device:
+                        P = P.to(dtype=param.grad.dtype, device=param.grad.device)
+
+                    # Ensure dimensions are compatible for projection
+                    grad_flat = param.grad.view(-1)
+
+                    if P.size(0) == grad_flat.size(0):
+                        # Apply projection: grad = grad - P * grad (following original)
+                        projected_grad = torch.mv(P, grad_flat)
+                        param.grad.data = (grad_flat - projected_grad).view_as(
+                            param.grad
+                        )
+                    elif len(param.size()) > 1:  # Multi-dimensional parameters
+                        # For conv/linear layers: apply projection to flattened version
+                        sz = param.grad.size(0)
+                        if P.size(0) >= sz:
+                            grad_2d = param.grad.view(sz, -1)
+                            P_sub = P[:sz, :sz]  # Take submatrix if needed
+                            projected = torch.mm(P_sub, grad_2d)
+                            param.grad.data = (grad_2d - projected).view_as(param.grad)
+
+                    param_idx += 1
+
+            # Log only occasionally to reduce verbosity
+            if not hasattr(self, '_projection_count'):
+                self._projection_count = 0
+            self._projection_count += 1
+
+            # Log every 50 projections or on first projection
+            if self._projection_count == 1 or self._projection_count % 50 == 0:
+                print(
+                    f"[GPM] Client {self.id} Applied orthogonal projection using {len(self.feature_list)} layer constraints (count: {self._projection_count})"
+                )
+
+        except Exception as e:
+            print(f"[GPM] Client {self.id} ERROR in GPM projection: {e}")

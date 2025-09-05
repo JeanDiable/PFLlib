@@ -124,9 +124,6 @@ class APOP(Server):
                 for client in self.clients:
                     self._set_client_current_task(client, i)
 
-            # APOP: Provide past bases to clients at start of new tasks
-            self._provide_past_bases_to_clients(i)
-
             if i % self.eval_gap == 0:
                 print(f"\n-------------Round number: {i}-------------")
                 if self.til_enable:
@@ -194,137 +191,6 @@ class APOP(Server):
             self.compute_cil_metrics()
         if self.til_enable:
             self._compute_til_final_metrics()
-
-    def _provide_past_bases_to_clients(self, current_round):
-        """Query knowledge base for updated past bases using client signatures."""
-        for client in self.clients:
-            client_id = client.id
-
-            # Check if client needs past bases query
-            if (
-                hasattr(client, 'needs_past_bases_query')
-                and client.needs_past_bases_query
-            ):
-                print(
-                    f"[APOP] Server processing past bases query for Client {client_id}"
-                )
-
-                # Get client's past task signatures
-                past_signatures = getattr(client, 'past_task_signatures', {})
-
-                if past_signatures:
-                    # Query knowledge base for each past signature and get updated bases
-                    past_bases_list = []
-                    for task_id, signature in past_signatures.items():
-                        retrieved_basis, similarity = self._query_knowledge_base(
-                            signature
-                        )
-                        if retrieved_basis is not None:
-                            past_bases_list.append(retrieved_basis)
-                            print(
-                                f"[APOP] Server found updated basis for Client {client_id} Task {task_id}, similarity: {similarity:.3f}"
-                            )
-
-                    if past_bases_list:
-                        # Stack all past bases into one matrix
-                        stacked_past_bases = self._stack_and_orthogonalize_bases(
-                            past_bases_list
-                        )
-                        client.set_past_bases(stacked_past_bases)
-                        print(
-                            f"[APOP] Server provided {len(past_bases_list)} updated past bases to Client {client_id}, final shape: {stacked_past_bases.shape}"
-                        )
-                    else:
-                        client.set_past_bases(None)
-                        print(
-                            f"[APOP] Server: No matching bases found for Client {client_id}"
-                        )
-
-                # Clear the query flag
-                client.needs_past_bases_query = False
-
-    def _stack_and_orthogonalize_bases(self, bases_list):
-        """Stack multiple bases and orthogonalize them using SVD to filter redundant components.
-
-        Args:
-            bases_list: List of basis matrices from different tasks
-
-        Returns:
-            Orthogonalized stacked basis matrix with redundant components filtered out
-        """
-        try:
-            # Stack all bases horizontally: [B1 | B2 | B3 | ...]
-            stacked = np.hstack(bases_list)
-
-            print(
-                f"[APOP] Server stacking {len(bases_list)} bases, input shape: {stacked.shape}"
-            )
-
-            # Use SVD to orthogonalize and filter redundant components
-            U, S, Vt = np.linalg.svd(stacked, full_matrices=False)
-
-            # Keep only truly important components using SVD analysis
-            # Use spectral gap detection and cumulative energy thresholds
-            cumulative_energy_threshold = (
-                0.95  # Keep components explaining 95% of variance
-            )
-            spectral_gap_ratio = 0.1  # Significant drop in singular values
-
-            if len(S) > 0:
-                # Method 1: Cumulative energy (most important)
-                total_energy = np.sum(S**2)
-                cumulative_energy = np.cumsum(S**2) / total_energy
-                energy_rank = (
-                    np.sum(cumulative_energy < cumulative_energy_threshold) + 1
-                )
-
-                # Method 2: Spectral gap detection
-                if len(S) > 1:
-                    ratios = S[1:] / S[:-1]  # Ratio of consecutive singular values
-                    gap_indices = np.where(ratios < spectral_gap_ratio)[0]
-                    spectral_rank = (
-                        gap_indices[0] + 1 if len(gap_indices) > 0 else len(S)
-                    )
-                else:
-                    spectral_rank = 1
-
-                # Use the most conservative (smallest) rank
-                rank = min(
-                    energy_rank, spectral_rank, self.subspace_dim // 2
-                )  # Never exceed half of subspace_dim
-            else:
-                rank = 0
-
-            effective_rank = max(1, min(rank, self.subspace_dim * len(bases_list)))
-
-            print(
-                f"[APOP] SVD analysis: energy_rank={energy_rank}, spectral_rank={spectral_rank}"
-            )
-            print(
-                f"[APOP] Cumulative energy (95%): {cumulative_energy[energy_rank-1]:.4f}"
-            )
-
-            print(f"[APOP] SVD results: U={U.shape}, S={S.shape}")
-            print(
-                f"[APOP] Rank analysis: full_rank={len(S)}, effective_rank={rank}, using={effective_rank}"
-            )
-            print(f"[APOP] Singular values (top 10): {S[:10]}")
-            print(f"[APOP] Energy ratios (top 10): {(S**2)[:10] / total_energy}")
-
-            # Keep only the most important orthogonal directions
-            Q_filtered = U[:, :effective_rank]
-
-            print(
-                f"[APOP] Server stacked {len(bases_list)} bases, final orthogonal basis: {Q_filtered.shape}"
-            )
-            return Q_filtered
-
-        except Exception as e:
-            print(f"[APOP] ERROR: Failed to stack and orthogonalize bases: {e}")
-            # Fallback: just return the first basis
-            if bases_list:
-                return bases_list[0]
-            return None
 
     def _handle_knowledge_transfer_request(self, client):
         """Handle a client's request for knowledge transfer."""
@@ -456,6 +322,21 @@ class APOP(Server):
             print(f"[APOP-KB] - Previous fusion count: {fusion_count}")
 
             # Stack bases and perform SVD fusion with proper filtering
+            # Handle variable-sized knowledge bases by padding to match dimensions
+            if basis_existing.shape[0] != basis_new.shape[0]:
+                max_rows = max(basis_existing.shape[0], basis_new.shape[0])
+                print(
+                    f"[APOP-KB] - Handling variable sizes: existing={basis_existing.shape[0]}, new={basis_new.shape[0]}, padding to {max_rows}"
+                )
+
+                if basis_existing.shape[0] < max_rows:
+                    pad_size = max_rows - basis_existing.shape[0]
+                    basis_existing = np.pad(basis_existing, ((0, pad_size), (0, 0)))
+
+                if basis_new.shape[0] < max_rows:
+                    pad_size = max_rows - basis_new.shape[0]
+                    basis_new = np.pad(basis_new, ((0, pad_size), (0, 0)))
+
             stacked_bases = np.hstack([basis_existing, basis_new])
             print(f"[APOP-KB] - Stacked bases shape: {stacked_bases.shape}")
 
@@ -580,27 +461,6 @@ class APOP(Server):
         print(f"[APOP-QUERY] === QUERY COMPLETE ===\n")
 
         return best_basis, max_similarity
-
-    def _compute_similarity(self, sig1, sig2):
-        """Compute cosine similarity between two task signatures."""
-        try:
-            if isinstance(sig1, torch.Tensor):
-                sig1 = sig1.cpu().numpy()
-            if isinstance(sig2, torch.Tensor):
-                sig2 = sig2.cpu().numpy()
-
-            # Normalize signatures
-            norm1 = np.linalg.norm(sig1)
-            norm2 = np.linalg.norm(sig2)
-
-            if norm1 == 0 or norm2 == 0:
-                return 0.0
-
-            similarity = np.dot(sig1, sig2) / (norm1 * norm2)
-            return max(0.0, similarity)  # Ensure non-negative
-        except Exception as e:
-            print(f"[APOP] Warning: Similarity computation failed: {e}")
-            return 0.0
 
     def _print_knowledge_base_status(self):
         """Print current knowledge base status for monitoring."""

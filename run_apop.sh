@@ -6,7 +6,7 @@
 # Configuration
 DATASET=${2:-"Cifar100"}  # Fixed: Use Cifar10 to match actual data
 NUM_CLIENTS=${3:-10}
-CILRPC=${4:-40}  # Rounds per task (main parameter to adjust)
+CILRPC=${4:-20}  # Rounds per task (main parameter to adjust)
 SEQUENCE_FILE=${1:-""}
 
 # Task sequence configuration (adjusted for Cifar10)
@@ -88,11 +88,13 @@ python main.py \
     -max_transfer_gain 0 \
     -min_adaptation_rounds 5 \
     -lr 0.01 \
-    -lbs 16 \
-    -ls 10\
-    -eg 5 \
+    -lbs 32 \
+    -ls 5\
+    -eg 3 \
+    -dev cuda \
+    -did 0 \
     -wandb True \
     -wandb_project "iclr26" \
-    -go "${DATASET}_${NUM_CLIENTS}c_${NUM_TASKS_PER_CLIENT}t_${CILRPC}rpt"
+    -go "${DATASET}_${NUM_CLIENTS}c_${NUM_TASKS_PER_CLIENT}t_${CILRPC}rpt_orth"
 
 echo "Experiment completed!"
