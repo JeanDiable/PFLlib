@@ -195,8 +195,17 @@ class clientAPOP(Client):
         """
         self.model.eval()
 
+        # Save original random state for restoration
+        original_torch_state = None
+        original_numpy_state = None
+
         # For deterministic signature computation, use fixed seed
         if fixed_seed:
+            # Save current random states
+            original_torch_state = torch.get_rng_state()
+            original_numpy_state = np.random.get_state()
+
+            # Set fixed seeds for deterministic computation
             torch.manual_seed(42)
             np.random.seed(42)
 
@@ -289,6 +298,15 @@ class clientAPOP(Client):
             # Fallback: random signature
             return np.random.randn(100) / 10
         finally:
+            # Restore original random states to avoid contaminating subsequent training
+            if (
+                fixed_seed
+                and original_torch_state is not None
+                and original_numpy_state is not None
+            ):
+                torch.set_rng_state(original_torch_state)
+                np.random.set_state(original_numpy_state)
+
             self.model.train()
 
     def _get_gradient_norm(self):

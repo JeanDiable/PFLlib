@@ -65,7 +65,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.ERROR)
 
 warnings.simplefilter("ignore")
-torch.manual_seed(0)
+torch.manual_seed(42)
 
 
 def run(args):
