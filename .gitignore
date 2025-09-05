@@ -5,3 +5,4 @@
 /dataset/Cifar10
 /dataset/MNIST
 /system/wandb
+/wandb

@@ -10,7 +10,7 @@ from utils.dataset_utils import check, save_file, separate_data, split_data
 
 random.seed(1)
 np.random.seed(1)
-num_clients = 10
+num_clients = 2
 dir_path = "Cifar10/"
 
 
@@ -74,7 +74,7 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
         niid,
         balance,
         partition,
-        class_per_client=2,
+        class_per_client=5,
     )
     train_data, test_data = split_data(X, y)
     save_file(

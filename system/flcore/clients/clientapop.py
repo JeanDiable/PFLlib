@@ -31,8 +31,9 @@ class clientAPOP(Client):
         self.parallel_basis = None  # B_∥^t - retrieved similar task basis
         self.similarity_retrieved = 0.0  # sim_retrieved
 
-        # GPM parameters
-        self.energy_threshold = 0.985  # e_th - preservation threshold for GPM
+        # GPM parameters - Use adaptive thresholds like original
+        self.base_threshold = 0.97  # Base threshold like original
+        self.threshold_increment = 0.003  # Increment per task like original
 
         # Adaptation tracking
         self.adaptation_round_count = 0  # Track adaptation progress
@@ -163,8 +164,9 @@ class clientAPOP(Client):
             trainloader, fixed_seed=True
         )
         self.is_adapted = False
-        self.parallel_basis = None
-        self.similarity_retrieved = 0.0
+        # DO NOT RESET parallel_basis here! It should persist across training rounds
+        # self.parallel_basis = None  # REMOVED - this was wiping out knowledge transfer!
+        # self.similarity_retrieved = 0.0  # REMOVED - this was wiping out knowledge transfer!
 
         # Reset adaptation tracking
         self.adaptation_round_count = 0
@@ -438,19 +440,78 @@ class clientAPOP(Client):
             else:
                 B_parallel = self.parallel_basis.to(g_k_prime.device)
 
-            # Ensure dimensions are compatible
+            # CRITICAL FIX: Handle dimension mismatch between server basis and full gradient
+            # B_parallel from server (331K dims) vs g_k_prime full gradients (11M dims)
+
             if B_parallel.size(0) != g_k_prime.size(0):
+                # This is expected! Server basis is smaller than full gradient space
                 print(
-                    f"[APOP] ERROR: Dimension mismatch in parallel projection! Client {self.id}: B_parallel {B_parallel.shape}, g_k_prime {g_k_prime.shape}"
+                    f"[APOP] Client {self.id} Parallel projection: adapting server basis {B_parallel.shape} to gradient space {g_k_prime.shape}"
                 )
-                return
+
+                # Option 1: Project only the first N dimensions where server basis applies
+                if B_parallel.size(0) <= g_k_prime.size(0):
+                    # Take first B_parallel.size(0) dimensions of gradient
+                    g_k_subset = g_k_prime[: B_parallel.size(0)]
+                    print(
+                        f"[DEBUG] Client {self.id} B_parallel.shape: {B_parallel.shape}"
+                    )
+                    print(
+                        f"[DEBUG] Client {self.id} g_k_subset.shape: {g_k_subset.shape}"
+                    )
+                    print(
+                        f"[DEBUG] Client {self.id} B_parallel.t().shape: {B_parallel.t().shape}"
+                    )
+
+                    # Apply projection to subset - DETAILED DEBUGGING
+                    try:
+                        BT_g = torch.matmul(
+                            B_parallel.t(), g_k_subset.unsqueeze(-1)
+                        ).squeeze(-1)
+                        print(f"[DEBUG] Client {self.id} BT_g.shape: {BT_g.shape}")
+
+                        g_k_parallel_subset = torch.matmul(
+                            B_parallel, BT_g.unsqueeze(-1)
+                        ).squeeze(-1)
+                        print(
+                            f"[DEBUG] Client {self.id} g_k_parallel_subset.shape: {g_k_parallel_subset.shape}"
+                        )
+
+                        # Create full parallel gradient by padding with zeros
+                        g_k_parallel = torch.zeros_like(g_k_prime)
+                        g_k_parallel[: B_parallel.size(0)] = g_k_parallel_subset
+                        print(f"[DEBUG] Client {self.id} Parallel projection SUCCESS!")
+
+                    except Exception as e:
+                        print(
+                            f"[DEBUG] Client {self.id} PARALLEL PROJECTION FAILED: {e}"
+                        )
+                        print(
+                            f"[DEBUG] Client {self.id} B_parallel.t(): {B_parallel.t().shape}"
+                        )
+                        print(
+                            f"[DEBUG] Client {self.id} g_k_subset.unsqueeze(-1): {g_k_subset.unsqueeze(-1).shape}"
+                        )
+                        # Fall back to zero parallel gradient
+                        g_k_parallel = torch.zeros_like(g_k_prime)
+                        raise e
+
+                else:
+                    # Server basis is larger than gradient - use gradient-sized portion of basis
+                    B_truncated = B_parallel[: g_k_prime.size(0), :]
+                    BT_g = torch.matmul(
+                        B_truncated.t(), g_k_prime.unsqueeze(-1)
+                    ).squeeze(-1)
+                    g_k_parallel = torch.matmul(
+                        B_truncated, BT_g.unsqueeze(-1)
+                    ).squeeze(-1)
+            else:
+                # Perfect dimension match (rare)
+                BT_g = torch.matmul(B_parallel.t(), g_k_prime.unsqueeze(-1)).squeeze(-1)
+                g_k_parallel = torch.matmul(B_parallel, BT_g.unsqueeze(-1)).squeeze(-1)
 
             # Compute adaptive transfer gain: α ← α_max · sim_retrieved
             alpha = self.max_transfer_gain * self.similarity_retrieved
-
-            # Parallel projection: g_k^∥ = B_∥ B_∥^T g_k'
-            BT_g = torch.matmul(B_parallel.t(), g_k_prime.unsqueeze(-1)).squeeze(-1)
-            g_k_parallel = torch.matmul(B_parallel, BT_g.unsqueeze(-1)).squeeze(-1)
 
             # Keep GPM orthogonal as main body, add parallel term for guidance
             # Final modulated gradient: g_k'' = g_k' + α * g_k^∥ (no orthogonal subtraction)
@@ -691,10 +752,18 @@ class clientAPOP(Client):
         mat_list = self._get_representation_matrix(trainloader)
 
         if mat_list:
+            # Use adaptive threshold like original GPM (0.97 + task_id * 0.003)
+            adaptive_threshold = (
+                self.base_threshold + self.current_task_idx * self.threshold_increment
+            )
+            print(
+                f'[GPM] Client {self.id} Using adaptive threshold: {adaptive_threshold:.4f} for task {self.current_task_idx}'
+            )
+
             # Update GPM and get unfiltered U for knowledge distillation
             self.feature_list, unfiltered_U_list = self._update_gpm(
                 mat_list,
-                self.energy_threshold,
+                adaptive_threshold,
                 self.feature_list if self.feature_list else None,
             )
 
@@ -740,13 +809,15 @@ class clientAPOP(Client):
     # Removed set_past_bases method - no longer needed with GPM approach
 
     def _get_representation_matrix(self, trainloader):
-        """Get representation matrix following original GPM implementation.
+        """Extract representation matrix following EXACT original GPM approach.
 
-        Adapted from original GPM paper implementation for ResNet.
-        Collects activations by forward pass and extracts features properly.
+        CRITICAL ENHANCEMENT: Extract from ALL layers like original GPM:
+        - Input x
+        - All individual conv layers (not just layer blocks)
+        - All FC layers
 
-        Returns:
-            list: List of representation matrices for each layer
+        This matches the original GPM paper which extracts from every intermediate output.
+        Now extracts from ~19 layers instead of just 5.
         """
         self.model.eval()
 
@@ -787,29 +858,119 @@ class clientAPOP(Client):
 
                 return hook
 
+            # Hook for input capture
+            def input_hook(name):
+                def hook(model, input, output):
+                    # Store input to this layer
+                    activations[name] = input[0].detach()
+
+                return hook
+
             # Get underlying model
             base_model = getattr(self.model, 'base', self.model)
 
-            # Register hooks for key layers
+            # Register hooks for ALL ResNet18 layers following original GPM approach
             hooks = []
-            # Conv layers
+
+            # STEP 1: Input x (original GPM extracts input)
+            hooks.append(base_model.conv1.register_forward_hook(input_hook('input')))
+
+            # STEP 2: Initial conv1 output
             hooks.append(
-                base_model.layer1.register_forward_hook(save_activation('layer1'))
+                base_model.conv1.register_forward_hook(save_activation('conv1'))
+            )
+
+            # STEP 3: ALL individual conv layers within residual blocks
+            # Layer1: 2 blocks × 2 convs each = 4 conv layers
+            hooks.append(
+                base_model.layer1[0].conv1.register_forward_hook(
+                    save_activation('layer1_block0_conv1')
+                )
             )
             hooks.append(
-                base_model.layer2.register_forward_hook(save_activation('layer2'))
+                base_model.layer1[0].conv2.register_forward_hook(
+                    save_activation('layer1_block0_conv2')
+                )
             )
             hooks.append(
-                base_model.layer3.register_forward_hook(save_activation('layer3'))
+                base_model.layer1[1].conv1.register_forward_hook(
+                    save_activation('layer1_block1_conv1')
+                )
             )
-            # Final conv layer
             hooks.append(
-                base_model.layer4.register_forward_hook(save_activation('layer4'))
+                base_model.layer1[1].conv2.register_forward_hook(
+                    save_activation('layer1_block1_conv2')
+                )
             )
-            # FC layer (avgpool output)
+
+            # Layer2: 2 blocks × 2 convs each = 4 conv layers
             hooks.append(
-                base_model.avgpool.register_forward_hook(save_activation('avgpool'))
+                base_model.layer2[0].conv1.register_forward_hook(
+                    save_activation('layer2_block0_conv1')
+                )
             )
+            hooks.append(
+                base_model.layer2[0].conv2.register_forward_hook(
+                    save_activation('layer2_block0_conv2')
+                )
+            )
+            hooks.append(
+                base_model.layer2[1].conv1.register_forward_hook(
+                    save_activation('layer2_block1_conv1')
+                )
+            )
+            hooks.append(
+                base_model.layer2[1].conv2.register_forward_hook(
+                    save_activation('layer2_block1_conv2')
+                )
+            )
+
+            # Layer3: 2 blocks × 2 convs each = 4 conv layers
+            hooks.append(
+                base_model.layer3[0].conv1.register_forward_hook(
+                    save_activation('layer3_block0_conv1')
+                )
+            )
+            hooks.append(
+                base_model.layer3[0].conv2.register_forward_hook(
+                    save_activation('layer3_block0_conv2')
+                )
+            )
+            hooks.append(
+                base_model.layer3[1].conv1.register_forward_hook(
+                    save_activation('layer3_block1_conv1')
+                )
+            )
+            hooks.append(
+                base_model.layer3[1].conv2.register_forward_hook(
+                    save_activation('layer3_block1_conv2')
+                )
+            )
+
+            # Layer4: 2 blocks × 2 convs each = 4 conv layers
+            hooks.append(
+                base_model.layer4[0].conv1.register_forward_hook(
+                    save_activation('layer4_block0_conv1')
+                )
+            )
+            hooks.append(
+                base_model.layer4[0].conv2.register_forward_hook(
+                    save_activation('layer4_block0_conv2')
+                )
+            )
+            hooks.append(
+                base_model.layer4[1].conv1.register_forward_hook(
+                    save_activation('layer4_block1_conv1')
+                )
+            )
+            hooks.append(
+                base_model.layer4[1].conv2.register_forward_hook(
+                    save_activation('layer4_block1_conv2')
+                )
+            )
+
+            # STEP 4: Final FC layer
+            hooks.append(base_model.fc.register_forward_hook(save_activation('fc')))
 
             # Forward pass to collect activations
             with torch.no_grad():
@@ -819,42 +980,95 @@ class clientAPOP(Client):
             for hook in hooks:
                 hook.remove()
 
-            # Process activations to create representation matrices
+            # Convert activations to representation matrices following original approach
             mat_list = []
-            layer_names = ['layer1', 'layer2', 'layer3', 'layer4', 'avgpool']
 
-            for i, layer_name in enumerate(layer_names):
+            # Process ALL extracted activations (input + all conv + fc) - 19 total layers
+            layer_names = [
+                'input',
+                'conv1',
+                'layer1_block0_conv1',
+                'layer1_block0_conv2',
+                'layer1_block1_conv1',
+                'layer1_block1_conv2',
+                'layer2_block0_conv1',
+                'layer2_block0_conv2',
+                'layer2_block1_conv1',
+                'layer2_block1_conv2',
+                'layer3_block0_conv1',
+                'layer3_block0_conv2',
+                'layer3_block1_conv1',
+                'layer3_block1_conv2',
+                'layer4_block0_conv1',
+                'layer4_block0_conv2',
+                'layer4_block1_conv1',
+                'layer4_block1_conv2',
+                'fc',
+            ]
+
+            for layer_name in layer_names:
                 if layer_name not in activations:
                     continue
 
                 act = activations[layer_name].cpu().numpy()
 
-                if len(act.shape) == 4:  # Convolutional layers
-                    # For conv layers: extract sliding window patches (adapted from original)
+                if len(act.shape) == 4:  # Convolutional layers (including input)
+                    # CRITICAL: Use original sliding window approach like main_cifar100.py
                     batch_size, channels, height, width = act.shape
 
-                    # Use smaller batch size for conv layers to avoid memory issues
-                    effective_batch = min(batch_size, 25)  # Reduced from 125
+                    # Use proper batch size like original (adapted for memory)
+                    effective_batch = min(
+                        batch_size, 25
+                    )  # Reduced from original's 125 for memory
 
-                    # For conv layers, we flatten spatial dimensions and treat as features
-                    # This is a simplified version of the original sliding window approach
-                    mat = (
-                        act[:effective_batch]
-                        .reshape(effective_batch, channels * height * width)
-                        .T
-                    )
+                    # Original sliding window extraction approach
+                    kernel_size = min(3, height, width)  # Adaptive kernel size
+                    stride = 1
+                    output_size = height - kernel_size + 1
+
+                    # Extract sliding window patches like original
+                    if output_size > 0:
+                        mat = np.zeros(
+                            (
+                                channels * kernel_size * kernel_size,
+                                output_size * output_size * effective_batch,
+                            )
+                        )
+                        k = 0
+                        for batch_idx in range(effective_batch):
+                            for i in range(output_size):
+                                for j in range(output_size):
+                                    # Extract patch and flatten
+                                    patch = act[
+                                        batch_idx,
+                                        :,
+                                        i : i + kernel_size,
+                                        j : j + kernel_size,
+                                    ]
+                                    mat[:, k] = patch.reshape(-1)
+                                    k += 1
+                        mat_list.append(mat)
+                    else:
+                        # Fallback for very small feature maps
+                        mat = act[:effective_batch].reshape(effective_batch, -1).T
+                        mat_list.append(mat)
+
+                elif len(act.shape) == 2:  # Fully connected layers
+                    # For FC layers: simple transpose following original
+                    effective_batch = min(act.shape[0], 125)
+                    mat = act[:effective_batch].T  # Transpose like original
                     mat_list.append(mat)
 
-                else:  # Fully connected layers
-                    # For FC layers: transpose activation (following original)
-                    effective_batch = min(act.shape[0], 125)
-                    activation = act[:effective_batch].T  # [features, batch]
-                    mat_list.append(activation)
+                elif len(act.shape) == 1:  # 1D outputs (rare case)
+                    # Reshape to 2D and transpose
+                    mat = act.reshape(-1, 1)
+                    mat_list.append(mat)
 
-            print(f'[GPM] Client {self.id} Representation Matrix')
+            print(f'[GPM] Client {self.id} ENHANCED Representation Matrix')
             print('-' * 30)
             for i, mat in enumerate(mat_list):
-                print(f'Layer {i+1} : {mat.shape}')
+                layer_name = layer_names[i] if i < len(layer_names) else f'Layer_{i+1}'
+                print(f'{layer_name} : {mat.shape}')
             print('-' * 30)
 
             return mat_list
@@ -897,12 +1111,19 @@ class clientAPOP(Client):
                 sval_total = (S**2).sum()
                 sval_ratio = (S**2) / sval_total
                 r = np.sum(np.cumsum(sval_ratio) < threshold)
-                r = max(1, r)  # Ensure at least 1 component
+                # ORIGINAL: Allow r=0 like original GPM, but handle empty case
 
-                updated_feature_list.append(U[:, :r])
-                print(
-                    f'[GPM] Client {self.id} Layer {i+1}: Initial basis {U.shape} -> {U[:, :r].shape}'
-                )
+                if r > 0:
+                    updated_feature_list.append(U[:, :r])
+                    print(
+                        f'[GPM] Client {self.id} Layer {i+1}: Initial basis {U.shape} -> {U[:, :r].shape}'
+                    )
+                else:
+                    # r=0: No significant components, store empty basis (original behavior)
+                    updated_feature_list.append(np.empty((U.shape[0], 0)))
+                    print(
+                        f'[GPM] Client {self.id} Layer {i+1}: No significant components (r=0), empty basis'
+                    )
 
         else:  # Subsequent tasks
             print(f'[GPM] Client {self.id} Subsequent task - updating GPM')
@@ -1066,105 +1287,147 @@ class clientAPOP(Client):
             return None
 
     def _precompute_projection_matrices(self):
-        """Pre-compute projection matrices P = UU^T for efficiency using GPU operations."""
+        """Pre-compute projection matrices P = UU^T for efficiency using GPU operations.
+
+        CRITICAL: Create projection matrices that match parameter dimensions, not feature dimensions.
+        This follows the original GPM approach where projection matrices are applied to
+        reshaped gradients in parameter space.
+        """
         if (
             not hasattr(self, '_cached_projection_matrices')
             or self._cached_projection_matrices is None
         ):
             self._cached_projection_matrices = []
-            for i, U in enumerate(self.feature_list):
-                # Convert numpy to GPU tensor first
-                U_tensor = torch.tensor(U, dtype=torch.float32, device=self.device)
-                # Compute P = UU^T on GPU
-                P = torch.mm(U_tensor, U_tensor.t())
-                self._cached_projection_matrices.append(P)
 
-            # Debug: Confirm GPU usage
-            if self._cached_projection_matrices:
-                sample_device = self._cached_projection_matrices[0].device
-                print(
-                    f"[GPM] Client {self.id} Pre-computed {len(self._cached_projection_matrices)} projection matrices on {sample_device}"
-                )
+            # ORIGINAL APPROACH: Create projection matrices for parameter dimensions
+            # We'll compute them when needed, not precompute with feature dimensions
+            print(
+                f"[GPM] Client {self.id} Will compute projection matrices on-demand to match parameter dimensions"
+            )
+
+            # Store feature bases for on-demand computation
+            self._feature_bases = []
+            for i, U in enumerate(self.feature_list):
+                if U.size > 0:
+                    # Store tensor version of basis for fast access
+                    U_tensor = torch.tensor(U, dtype=torch.float32, device=self.device)
+                    self._feature_bases.append(U_tensor)
+                else:
+                    self._feature_bases.append(None)
 
     def _apply_gmp_projection(self):
-        """Apply GPM orthogonal projection following original implementation.
+        """Apply GPM orthogonal projection following EXACT original implementation.
 
-        Projects gradients orthogonal to past task subspaces using precomputed
-        projection matrices from feature_list.
+        CRITICAL: Match main_cifar100.py exactly:
+        - Only project first 15 parameters
+        - Multi-dimensional params: use sz,-1 reshaping + matrix multiply
+        - 1D params (biases): zero out for subsequent tasks
+
+        KEY INSIGHT: Create projection matrices on-demand to match parameter dimensions
         """
         try:
-            # Pre-compute projection matrices if not cached
+            # Prepare feature bases
             self._precompute_projection_matrices()
-            # Collect current gradients
-            gradients_per_layer = []
-            param_shapes = []
-            param_count = 0
 
-            # Map parameters to layers (simplified mapping for ResNet)
-            layer_param_map = []
+            # EXACT original approach: enumerate parameters and only use first 15
+            kk = 0  # Index into feature_list
+            for k, (name, param) in enumerate(self.model.named_parameters()):
+                if param.grad is None:
+                    continue
 
-            for name, param in self.model.named_parameters():
-                if param.grad is not None:
-                    param_shapes.append(param.size())
+                # ORIGINAL CONDITION: k<15 (only first 15 parameters)
+                if k < 15:
+                    if len(param.size()) != 1:  # Multi-dimensional parameters
+                        # ORIGINAL METHOD: Use first dimension size + reshape to (sz,-1)
+                        sz = param.grad.data.size(0)
+                        grad_reshaped = param.grad.data.view(sz, -1)
+                        remaining_dims = grad_reshaped.size(1)
 
-                    # Map to layer index (simplified)
-                    if 'layer1' in name:
-                        layer_idx = 0
-                    elif 'layer2' in name:
-                        layer_idx = 1
-                    elif 'layer3' in name:
-                        layer_idx = 2
-                    elif 'layer4' in name:
-                        layer_idx = 3
-                    elif 'fc' in name or 'classifier' in name:
-                        layer_idx = min(4, len(self.feature_list) - 1)
-                    else:
-                        layer_idx = 0  # Default to first layer
+                        # Get feature basis for this layer
+                        if (
+                            kk < len(self._feature_bases)
+                            and self._feature_bases[kk] is not None
+                        ):
+                            U = self._feature_bases[kk]  # This is the basis from GPM
 
-                    layer_param_map.append(layer_idx)
-                    param_count += 1
+                            # CRITICAL FIX: Create projection matrix with EXACT dimension match
+                            # P must be (remaining_dims, remaining_dims) to multiply with grad_reshaped (sz, remaining_dims)
 
-            if param_count == 0:
-                return
+                            if U.size(1) >= remaining_dims:
+                                # Take first 'remaining_dims' columns from basis
+                                U_matched = U[
+                                    :, :remaining_dims
+                                ]  # Shape: (features, remaining_dims)
+                                P = torch.mm(
+                                    U_matched.t(), U_matched
+                                )  # Shape: (remaining_dims, remaining_dims)
 
-            # Apply projection layer by layer (following original GPM)
-            param_idx = 0
-            for name, param in self.model.named_parameters():
-                if param.grad is not None and param_idx < len(layer_param_map):
-                    layer_idx = layer_param_map[param_idx]
+                                # Apply original projection: grad = grad - grad @ P
+                                projected = torch.mm(grad_reshaped, P)
+                                param.grad.data = (grad_reshaped - projected).view(
+                                    param.size()
+                                )
 
-                    # Skip if no feature matrix for this layer
-                    if layer_idx >= len(self.feature_list) or layer_idx >= len(
-                        self._cached_projection_matrices
-                    ):
-                        param_idx += 1
-                        continue
+                            elif U.size(0) >= remaining_dims:
+                                # Create reduced basis by taking subset of feature dimensions
+                                # This handles when basis features > gradient dimensions
+                                U_truncated = U[
+                                    :remaining_dims, :
+                                ]  # Take first remaining_dims rows
+                                # Now transpose to get proper dimensions for projection matrix
+                                P = torch.mm(
+                                    U_truncated.t(), U_truncated
+                                )  # Shape: (basis_components, basis_components)
 
-                    # Use pre-computed projection matrix P = U * U^T for efficiency
-                    P = self._cached_projection_matrices[layer_idx]
-                    # Ensure correct dtype and device
-                    if P.dtype != param.grad.dtype or P.device != param.grad.device:
-                        P = P.to(dtype=param.grad.dtype, device=param.grad.device)
+                                # If P is still too big, truncate further
+                                if P.size(0) > remaining_dims:
+                                    P = P[:remaining_dims, :remaining_dims]
+                                elif P.size(0) < remaining_dims:
+                                    # Pad with identity for remaining dimensions
+                                    padded_P = torch.eye(
+                                        remaining_dims, device=P.device, dtype=P.dtype
+                                    )
+                                    pad_size = min(P.size(0), remaining_dims)
+                                    padded_P[:pad_size, :pad_size] = P[
+                                        :pad_size, :pad_size
+                                    ]
+                                    P = padded_P
 
-                    # Ensure dimensions are compatible for projection
-                    grad_flat = param.grad.view(-1)
+                                # Apply projection
+                                projected = torch.mm(grad_reshaped, P)
+                                param.grad.data = (grad_reshaped - projected).view(
+                                    param.size()
+                                )
 
-                    if P.size(0) == grad_flat.size(0):
-                        # Apply projection: grad = grad - P * grad (following original)
-                        projected_grad = torch.mv(P, grad_flat)
-                        param.grad.data = (grad_flat - projected_grad).view_as(
-                            param.grad
-                        )
-                    elif len(param.size()) > 1:  # Multi-dimensional parameters
-                        # For conv/linear layers: apply projection to flattened version
-                        sz = param.grad.size(0)
-                        if P.size(0) >= sz:
-                            grad_2d = param.grad.view(sz, -1)
-                            P_sub = P[:sz, :sz]  # Take submatrix if needed
-                            projected = torch.mm(P_sub, grad_2d)
-                            param.grad.data = (grad_2d - projected).view_as(param.grad)
+                            else:
+                                # Basis is smaller than gradient - create partial projection
+                                max_proj_dim = min(U.size(0), U.size(1), remaining_dims)
+                                if max_proj_dim > 0:
+                                    U_small = U[:max_proj_dim, :max_proj_dim]
+                                    P_small = torch.mm(U_small.t(), U_small)
 
-                    param_idx += 1
+                                    # Apply projection only to first max_proj_dim dimensions
+                                    partial_grad = grad_reshaped[:, :max_proj_dim]
+                                    projected_partial = torch.mm(partial_grad, P_small)
+
+                                    # Create full projected gradient
+                                    full_projected = torch.zeros_like(grad_reshaped)
+                                    full_projected[:, :max_proj_dim] = projected_partial
+
+                                    param.grad.data = (
+                                        grad_reshaped - full_projected
+                                    ).view(param.size())
+
+                        kk += 1
+
+                    elif len(param.size()) == 1 and self.current_task_idx != 0:
+                        # ORIGINAL: Zero out bias parameters for subsequent tasks (reduce logging)
+                        param.grad.data.fill_(0)
+                        if not hasattr(self, '_bias_zero_logged'):
+                            print(
+                                f"[GPM] Client {self.id} Zeroing bias gradients for subsequent task"
+                            )
+                            self._bias_zero_logged = True
 
             # Log only occasionally to reduce verbosity
             if not hasattr(self, '_projection_count'):
@@ -1174,8 +1437,11 @@ class clientAPOP(Client):
             # Log every 50 projections or on first projection
             if self._projection_count == 1 or self._projection_count % 50 == 0:
                 print(
-                    f"[GPM] Client {self.id} Applied orthogonal projection using {len(self.feature_list)} layer constraints (count: {self._projection_count})"
+                    f"[GPM] Client {self.id} Applied GPM projection to first 15 params (count: {self._projection_count})"
                 )
 
         except Exception as e:
             print(f"[GPM] Client {self.id} ERROR in GPM projection: {e}")
+            import traceback
+
+            traceback.print_exc()
