@@ -10,7 +10,7 @@ from utils.dataset_utils import check, save_file, separate_data, split_data
 
 random.seed(1)
 np.random.seed(1)
-num_clients = 10
+num_clients = 5
 dir_path = "Cifar100/"
 
 

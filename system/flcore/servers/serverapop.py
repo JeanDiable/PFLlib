@@ -128,18 +128,6 @@ class APOP(Server):
                     print(f"[PFTIL-APOP] TIL disabled - clients will use all classes")
                     self._til_disabled_logged = True
 
-            if i % self.eval_gap == 0:
-                print(f"\n-------------Round number: {i}-------------")
-                if self.til_enable:
-                    print("\nEvaluate TIL tasks")
-                    self._evaluate_til_all_tasks(i)
-                elif self.pfcl_enable:
-                    print("\nEvaluate personalized models")
-                    self.evaluate_pfcl(i)
-                else:
-                    print("\nEvaluate global model")
-                    self.evaluate()
-
             # APOP: Handle knowledge transfer requests during training
             for client in self.selected_clients:
                 # Set current round for client metrics timestamping
@@ -160,6 +148,19 @@ class APOP(Server):
 
             # APOP: Additional task completion processing for knowledge base
             self._apop_collect_task_completions(i)
+
+            # FIXED: Evaluate AFTER training to see true forgetting effects
+            if i % self.eval_gap == 0:
+                print(f"\n-------------Round number: {i}-------------")
+                if self.til_enable:
+                    print("\nEvaluate TIL tasks")
+                    self._evaluate_til_all_tasks(i)
+                elif self.pfcl_enable:
+                    print("\nEvaluate personalized models")
+                    self.evaluate_pfcl(i)
+                else:
+                    print("\nEvaluate global model")
+                    self.evaluate()
 
             if self.dlg_eval and i % self.dlg_gap == 0:
                 self.call_dlg(i)

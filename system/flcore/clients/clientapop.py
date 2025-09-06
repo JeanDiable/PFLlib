@@ -1230,9 +1230,14 @@ class clientAPOP(Client):
             if not hasattr(self, '_knowledge_distillation_count'):
                 self._knowledge_distillation_count = 0
             self._knowledge_distillation_count += 1
-            
-            if self._knowledge_distillation_count == 1 or self._knowledge_distillation_count % 10 == 0:
-                print(f"[APOP] Client {self.id} distilling knowledge from GPM basis (count: {self._knowledge_distillation_count})")
+
+            if (
+                self._knowledge_distillation_count == 1
+                or self._knowledge_distillation_count % 10 == 0
+            ):
+                print(
+                    f"[APOP] Client {self.id} distilling knowledge from GPM basis (count: {self._knowledge_distillation_count})"
+                )
 
             # Concatenate all unfiltered U matrices (flatten layer information)
             # This gives us the full gradient space representation before GPM filtering
@@ -1353,7 +1358,7 @@ class clientAPOP(Client):
                     continue
 
                 # ORIGINAL CONDITION: k<15 (only first 15 parameters)
-                if k < 15:
+                if k < 17:
                     if len(param.size()) != 1:  # Multi-dimensional parameters
                         # ORIGINAL METHOD: Use first dimension size + reshape to (sz,-1)
                         sz = param.grad.data.size(0)

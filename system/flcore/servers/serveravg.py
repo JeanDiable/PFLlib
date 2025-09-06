@@ -78,18 +78,6 @@ class FedAvg(Server):
                     print(f"[PFTIL-FEDAVG] TIL disabled - clients will use all classes")
                     self._til_disabled_logged = True
 
-            if i % self.eval_gap == 0:
-                print(f"\n-------------Round number: {i}-------------")
-                if self.til_enable:
-                    print("\nEvaluate TIL tasks")
-                    self._evaluate_til_all_tasks(i)
-                elif self.pfcl_enable:
-                    print("\nEvaluate personalized models")
-                    self.evaluate_pfcl(i)
-                else:
-                    print("\nEvaluate global model")
-                    self.evaluate()
-
             for client in self.selected_clients:
                 client.train()
 
@@ -102,6 +90,19 @@ class FedAvg(Server):
 
             # TIL: Collect task completions and advance clients to next tasks
             self._collect_task_completions(i)
+
+            # FIXED: Evaluate AFTER training to see true forgetting effects
+            if i % self.eval_gap == 0:
+                print(f"\n-------------Round number: {i}-------------")
+                if self.til_enable:
+                    print("\nEvaluate TIL tasks")
+                    self._evaluate_til_all_tasks(i)
+                elif self.pfcl_enable:
+                    print("\nEvaluate personalized models")
+                    self.evaluate_pfcl(i)
+                else:
+                    print("\nEvaluate global model")
+                    self.evaluate()
 
             if self.dlg_eval and i % self.dlg_gap == 0:
                 self.call_dlg(i)

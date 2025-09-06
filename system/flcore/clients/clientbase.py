@@ -510,12 +510,7 @@ class Client(object):
         if not self.current_task_classes:
             return self.loss(output, target)
 
-        # Create a mask - set non-current-task outputs to zero
-        masked_output = output.clone()
-
         task_classes = list(self.current_task_classes)
-
-        # Get all class indices
         all_classes = set(range(output.size(1)))
         non_task_classes = all_classes - set(task_classes)
 
@@ -526,11 +521,31 @@ class Client(object):
             )
             self._logged_train_masking = True
 
-        # Mask non-task classes
-        for cls in non_task_classes:
-            masked_output[:, cls] = float('-inf')
+        # TRUE TIL: Only compute loss for current task classes
+        # This prevents gradients from flowing to non-task output neurons
+        task_indices = torch.tensor(task_classes, device=output.device)
 
-        return self.loss(masked_output, target)
+        # Extract only task-relevant outputs and corresponding targets
+        task_output = output[:, task_indices]
+
+        # Create task-local target mapping
+        target_mask = torch.isin(target, task_indices)
+
+        if not target_mask.any():
+            # No samples from current task in this batch
+            return torch.tensor(0.0, requires_grad=True, device=output.device)
+
+        # Filter to only task-relevant samples
+        filtered_output = task_output[target_mask]
+        filtered_target = target[target_mask]
+
+        # Map targets to local task indices (0, 1, 2, ...)
+        target_mapping = {cls.item(): i for i, cls in enumerate(task_indices)}
+        mapped_target = torch.tensor(
+            [target_mapping[t.item()] for t in filtered_target], device=output.device
+        )
+
+        return self.loss(filtered_output, mapped_target)
 
     def get_current_task_classes(self):
         """
