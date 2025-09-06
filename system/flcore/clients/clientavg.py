@@ -44,20 +44,24 @@ class clientAVG(Client):
                     loss = self._mask_loss_for_training(output, y)
                     # PFTIL Logging: TIL training confirmed
                     if not hasattr(self, '_til_training_logged'):
-                        print(f"[PFTIL-FEDAVG] Client {self.id}: Using TIL-aware loss for task-incremental training")
+                        print(
+                            f"[PFTIL-FEDAVG] Client {self.id}: Using TIL-aware loss for task-incremental training"
+                        )
                         self._til_training_logged = True
                 else:
                     loss = self.loss(output, y)
                     # PFTIL Logging: Standard training
                     if not hasattr(self, '_std_training_logged'):
-                        print(f"[PFTIL-FEDAVG] Client {self.id}: Using standard loss (TIL not enabled)")
+                        print(
+                            f"[PFTIL-FEDAVG] Client {self.id}: Using standard loss (TIL not enabled)"
+                        )
                         self._std_training_logged = True
-                
+
                 # Track loss for logging
                 batch_size = y.size(0)
                 total_loss += loss.item() * batch_size
                 total_samples += batch_size
-                
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()

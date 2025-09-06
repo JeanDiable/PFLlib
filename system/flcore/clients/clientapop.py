@@ -87,13 +87,17 @@ class clientAPOP(Client):
                     loss = self._mask_loss_for_training(output, y)
                     # PFTIL Logging: TIL training confirmed
                     if not hasattr(self, '_til_training_logged'):
-                        print(f"[PFTIL-APOP] Client {self.id}: Using TIL-aware loss for task-incremental training")
+                        print(
+                            f"[PFTIL-APOP] Client {self.id}: Using TIL-aware loss for task-incremental training"
+                        )
                         self._til_training_logged = True
                 else:
                     loss = self.loss(output, y)
                     # PFTIL Logging: Standard training
                     if not hasattr(self, '_std_training_logged'):
-                        print(f"[PFTIL-APOP] Client {self.id}: Using standard loss (TIL not enabled)")
+                        print(
+                            f"[PFTIL-APOP] Client {self.id}: Using standard loss (TIL not enabled)"
+                        )
                         self._std_training_logged = True
 
                 # Track loss for logging
@@ -232,13 +236,17 @@ class clientAPOP(Client):
                 loss = self._mask_loss_for_training(output, y)
                 # PFTIL Logging: TIL gradient computation
                 if not hasattr(self, '_til_gradient_logged'):
-                    print(f"[PFTIL-APOP] Client {self.id}: Using TIL-aware loss for gradient computation")
+                    print(
+                        f"[PFTIL-APOP] Client {self.id}: Using TIL-aware loss for gradient computation"
+                    )
                     self._til_gradient_logged = True
             else:
                 loss = self.loss(output, y)
                 # PFTIL Logging: Standard gradient computation
                 if not hasattr(self, '_std_gradient_logged'):
-                    print(f"[PFTIL-APOP] Client {self.id}: Using standard loss for gradient computation")
+                    print(
+                        f"[PFTIL-APOP] Client {self.id}: Using standard loss for gradient computation"
+                    )
                     self._std_gradient_logged = True
 
             # Get gradients
@@ -364,9 +372,12 @@ class clientAPOP(Client):
 
         # Check for gradient explosion and apply clipping if needed
         if original_grad_norm > 1e10:
-            print(
-                f"[APOP] WARNING: Client {self.id} gradient explosion! Norm: {original_grad_norm:.2e} - Applying gradient clipping"
-            )
+            # Log gradient explosion warning only once per client to avoid spam
+            if not hasattr(self, '_gradient_explosion_logged'):
+                print(
+                    f"[APOP] WARNING: Client {self.id} gradient explosion! Norm: {original_grad_norm:.2e} - Applying gradient clipping"
+                )
+                self._gradient_explosion_logged = True
             # Apply gradient clipping
             for param in self.model.parameters():
                 if param.grad is not None:
@@ -1206,13 +1217,22 @@ class clientAPOP(Client):
             numpy.ndarray: Knowledge basis for server
         """
         if not unfiltered_U_list:
-            print(
-                f"[APOP] Client {self.id} WARNING: No unfiltered U available for knowledge distillation"
-            )
+            # Log this warning only once per client to avoid spam
+            if not hasattr(self, '_no_unfiltered_u_logged'):
+                print(
+                    f"[APOP] Client {self.id} WARNING: No unfiltered U available for knowledge distillation"
+                )
+                self._no_unfiltered_u_logged = True
             return None
 
         try:
-            print(f"[APOP] Client {self.id} distilling knowledge from GPM basis")
+            # Log knowledge distillation only occasionally to reduce verbosity
+            if not hasattr(self, '_knowledge_distillation_count'):
+                self._knowledge_distillation_count = 0
+            self._knowledge_distillation_count += 1
+            
+            if self._knowledge_distillation_count == 1 or self._knowledge_distillation_count % 10 == 0:
+                print(f"[APOP] Client {self.id} distilling knowledge from GPM basis (count: {self._knowledge_distillation_count})")
 
             # Concatenate all unfiltered U matrices (flatten layer information)
             # This gives us the full gradient space representation before GPM filtering

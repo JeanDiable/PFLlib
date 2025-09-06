@@ -118,7 +118,9 @@ class APOP(Server):
 
             # TIL: Set current task classes for clients
             if self.til_enable:
-                print(f"[PFTIL-APOP] Round {i}: Setting current task classes for all clients")
+                print(
+                    f"[PFTIL-APOP] Round {i}: Setting current task classes for all clients"
+                )
                 for client in self.clients:
                     self._set_client_current_task(client, i)
             else:
@@ -165,9 +167,13 @@ class APOP(Server):
             # APOP: In PFCL mode, skip global aggregation
             if not self.pfcl_enable:
                 self.aggregate_parameters()
-                print(f"[PFTIL-APOP] Round {i}: Parameters aggregated across {len(self.selected_clients)} clients")
+                print(
+                    f"[PFTIL-APOP] Round {i}: Parameters aggregated across {len(self.selected_clients)} clients"
+                )
             else:
-                print(f"[PFTIL-APOP] Round {i}: Skipping parameter aggregation - each client maintains personal model (PFCL mode)")
+                print(
+                    f"[PFTIL-APOP] Round {i}: Skipping parameter aggregation - each client maintains personal model (PFCL mode)"
+                )
 
             # Log training losses to wandb
             if hasattr(self, 'wandb_enable') and self.wandb_enable:
@@ -545,7 +551,9 @@ class APOP(Server):
         """Aggregate parameters (only in traditional FL mode)."""
         if self.pfcl_enable:
             # In PFCL mode, no aggregation - each client maintains its own model
-            print("[PFTIL-APOP] PFCL mode: Parameter aggregation skipped - maintaining personalized models")
+            print(
+                "[PFTIL-APOP] PFCL mode: Parameter aggregation skipped - maintaining personalized models"
+            )
             return
 
         # Traditional FL aggregation

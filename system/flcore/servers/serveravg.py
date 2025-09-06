@@ -68,7 +68,9 @@ class FedAvg(Server):
 
             # TIL: Set current task classes for clients
             if self.til_enable:
-                print(f"[PFTIL-FEDAVG] Round {i}: Setting current task classes for all clients")
+                print(
+                    f"[PFTIL-FEDAVG] Round {i}: Setting current task classes for all clients"
+                )
                 for client in self.clients:
                     self._set_client_current_task(client, i)
             else:
@@ -107,7 +109,9 @@ class FedAvg(Server):
             # Only aggregate if not in PFCL mode (personalized learning)
             if not self.pfcl_enable:
                 self.aggregate_parameters()
-                print(f"[PFTIL-FEDAVG] Round {i}: Parameters aggregated across {len(self.selected_clients)} clients")
+                print(
+                    f"[PFTIL-FEDAVG] Round {i}: Parameters aggregated across {len(self.selected_clients)} clients"
+                )
             else:
                 print(
                     f"[PFTIL-FEDAVG] Round {i}: Skipping parameter aggregation - each client maintains personal model (PFCL mode)"

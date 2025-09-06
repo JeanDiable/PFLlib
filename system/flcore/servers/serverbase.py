@@ -41,7 +41,9 @@ class Server(object):
         else:
             # PFCL: No global model, each client has personal model
             self.global_model = None
-            print(f"[PFTIL-SERVER] Server initialized without global model - personalized learning enabled (PFCL=True)")
+            print(
+                f"[PFTIL-SERVER] Server initialized without global model - personalized learning enabled (PFCL=True)"
+            )
 
         self.num_clients = args.num_clients
         self.join_ratio = args.join_ratio
@@ -67,9 +69,13 @@ class Server(object):
         self.til_enable = getattr(args, 'til_enable', False)
 
         # PFTIL Logging: Server CIL/TIL initialization
-        print(f"[PFTIL-SERVER] CIL enabled: {self.cil_enable}, TIL enabled: {self.til_enable}")
+        print(
+            f"[PFTIL-SERVER] CIL enabled: {self.cil_enable}, TIL enabled: {self.til_enable}"
+        )
         if self.cil_enable:
-            print(f"[PFTIL-SERVER] CIL rounds per class: {self.cil_rounds_per_class}, batch size: {self.cil_batch_size}")
+            print(
+                f"[PFTIL-SERVER] CIL rounds per class: {self.cil_rounds_per_class}, batch size: {self.cil_batch_size}"
+            )
 
         # Client-specific task sequences (available when CIL enabled)
         self.client_sequences = getattr(args, 'client_sequences', None)
@@ -79,7 +85,9 @@ class Server(object):
                 self.client_task_sequences = self._parse_client_sequences(
                     self.client_sequences
                 )
-                print(f"[PFTIL-SERVER] Using client-specific task sequences: {len(self.client_task_sequences)} clients")
+                print(
+                    f"[PFTIL-SERVER] Using client-specific task sequences: {len(self.client_task_sequences)} clients"
+                )
             else:
                 # All clients use same sequence (traditional CIL)
                 self.cil_order = self._parse_cil_order(
@@ -186,13 +194,18 @@ class Server(object):
                 print(
                     f"[PFTIL-TASK] Server assigned task sequence to client {i}: {client.task_sequence}"
                 )
-            elif hasattr(self, 'client_task_sequences') and i in self.client_task_sequences:
+            elif (
+                hasattr(self, 'client_task_sequences')
+                and i in self.client_task_sequences
+            ):
                 client.task_sequence = self.client_task_sequences[i]
                 print(
                     f"[PFTIL-TASK] Server assigned task sequence to client {i}: {client.task_sequence}"
                 )
             else:
-                print(f"[PFTIL-TASK] No task sequence assigned to client {i} - using default CIL behavior")
+                print(
+                    f"[PFTIL-TASK] No task sequence assigned to client {i} - using default CIL behavior"
+                )
 
             self.clients.append(client)
 
@@ -899,7 +912,9 @@ class Server(object):
         client_task_sequence = self.client_task_sequences.get(client.id, [])
         if not client_task_sequence:
             client.current_task_classes = set(range(self.num_classes))
-            print(f"[PFTIL-SERVER] Client {client.id}: No task sequence found, using all classes {client.current_task_classes}")
+            print(
+                f"[PFTIL-SERVER] Client {client.id}: No task sequence found, using all classes {client.current_task_classes}"
+            )
             return
 
         # Determine current task based on round
@@ -910,11 +925,13 @@ class Server(object):
 
         # Check if task has changed (only log when there's a change)
         prev_task_idx = getattr(client, 'current_task_idx', -1)
-        
+
         if current_task_idx < len(client_task_sequence):
             client.current_task_classes = set(client_task_sequence[current_task_idx])
             if current_task_idx != prev_task_idx:
-                print(f"[PFTIL-SERVER] Client {client.id} round {current_round}: Set current task {current_task_idx} classes {client.current_task_classes}")
+                print(
+                    f"[PFTIL-SERVER] Client {client.id} round {current_round}: Set current task {current_task_idx} classes {client.current_task_classes}"
+                )
         else:
             # If beyond available tasks, use last task
             final_task_idx = len(client_task_sequence) - 1
@@ -922,14 +939,22 @@ class Server(object):
                 set(client_task_sequence[-1]) if client_task_sequence else set()
             )
             if final_task_idx != prev_task_idx:
-                print(f"[PFTIL-SERVER] Client {client.id} round {current_round}: Beyond available tasks, using final task classes {client.current_task_classes}")
+                print(
+                    f"[PFTIL-SERVER] Client {client.id} round {current_round}: Beyond available tasks, using final task classes {client.current_task_classes}"
+                )
 
         # Update the client's current task index if supported
         if hasattr(client, 'current_task_idx'):
-            new_task_idx = min(current_task_idx, len(client_task_sequence) - 1) if client_task_sequence else 0
+            new_task_idx = (
+                min(current_task_idx, len(client_task_sequence) - 1)
+                if client_task_sequence
+                else 0
+            )
             if new_task_idx != client.current_task_idx:
                 client.current_task_idx = new_task_idx
-                print(f"[PFTIL-SERVER] Client {client.id}: Updated current_task_idx to {client.current_task_idx}")
+                print(
+                    f"[PFTIL-SERVER] Client {client.id}: Updated current_task_idx to {client.current_task_idx}"
+                )
 
     def _evaluate_til_all_tasks(self, current_round):
         """Evaluate all clients on all their seen tasks for TIL."""
@@ -1299,7 +1324,9 @@ class Server(object):
 
         # Check if we're at the end of a task period
         if (current_round + 1) % self.cil_rounds_per_class == 0:
-            print(f"[PFTIL-SERVER] Round {current_round}: End of task period detected - checking for client task transitions")
+            print(
+                f"[PFTIL-SERVER] Round {current_round}: End of task period detected - checking for client task transitions"
+            )
             for client in self.clients:
                 if hasattr(client, 'advance_to_next_task'):
                     advanced = client.advance_to_next_task()
@@ -1308,6 +1335,10 @@ class Server(object):
                             f"[PFTIL-SERVER] Client {client.id} successfully advanced to next task at round {current_round}"
                         )
                     else:
-                        print(f"[PFTIL-SERVER] Client {client.id} could not advance (likely at final task)")
+                        print(
+                            f"[PFTIL-SERVER] Client {client.id} could not advance (likely at final task)"
+                        )
                 else:
-                    print(f"[PFTIL-SERVER] WARNING: Client {client.id} doesn't support task advancement")
+                    print(
+                        f"[PFTIL-SERVER] WARNING: Client {client.id} doesn't support task advancement"
+                    )
