@@ -25,7 +25,6 @@ class clientAPOP(Client):
 
         # Client state
         self.feature_list = []  # GPM feature list (orthogonal subspaces for each layer)
-        self.current_task_idx = 0
         self.is_adapted = False
         self.initial_signature = None
         self.parallel_basis = None  # B_∥^t - retrieved similar task basis
@@ -39,8 +38,7 @@ class clientAPOP(Client):
         self.adaptation_round_count = 0  # Track adaptation progress
         self.task_start_round = 0  # Remember when task started
 
-        # Ensure TIL is enabled for proper task-specific evaluation
-        self.til_enable = getattr(args, 'til_enable', False)
+        # Note: til_enable now set in base Client class
 
         print(
             f"[APOP] Client {self.id} initialized with subspace_dim={self.subspace_dim}, "
@@ -87,8 +85,16 @@ class clientAPOP(Client):
                 # TIL: Use task-aware loss if enabled
                 if getattr(self, 'til_enable', False):
                     loss = self._mask_loss_for_training(output, y)
+                    # PFTIL Logging: TIL training confirmed
+                    if not hasattr(self, '_til_training_logged'):
+                        print(f"[PFTIL-APOP] Client {self.id}: Using TIL-aware loss for task-incremental training")
+                        self._til_training_logged = True
                 else:
                     loss = self.loss(output, y)
+                    # PFTIL Logging: Standard training
+                    if not hasattr(self, '_std_training_logged'):
+                        print(f"[PFTIL-APOP] Client {self.id}: Using standard loss (TIL not enabled)")
+                        self._std_training_logged = True
 
                 # Track loss for logging
                 batch_size = y.size(0)
@@ -224,8 +230,16 @@ class clientAPOP(Client):
             output = self.model(x)
             if getattr(self, 'til_enable', False):
                 loss = self._mask_loss_for_training(output, y)
+                # PFTIL Logging: TIL gradient computation
+                if not hasattr(self, '_til_gradient_logged'):
+                    print(f"[PFTIL-APOP] Client {self.id}: Using TIL-aware loss for gradient computation")
+                    self._til_gradient_logged = True
             else:
                 loss = self.loss(output, y)
+                # PFTIL Logging: Standard gradient computation
+                if not hasattr(self, '_std_gradient_logged'):
+                    print(f"[PFTIL-APOP] Client {self.id}: Using standard loss for gradient computation")
+                    self._std_gradient_logged = True
 
             # Get gradients
             self.model.zero_grad()

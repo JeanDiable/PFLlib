@@ -26,7 +26,7 @@ class clientParS(Client):
         self.transfer_gain_factor = 0.0  # Alpha_k in the algorithm
 
         # Track task transitions for signature computation
-        self.current_task_classes = set()
+        # Note: current_task_classes now initialized in base Client class
         self.previous_task_classes = set()
 
         print(
@@ -332,6 +332,3 @@ class clientParS(Client):
             if 0 <= stage < len(self.task_sequence):
                 return set(self.task_sequence[stage])
         return set(range(self.num_classes))
-
-
-

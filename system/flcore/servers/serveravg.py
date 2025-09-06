@@ -29,15 +29,29 @@ class FedAvg(Server):
         if self.cil_rounds_per_class <= 0:
             return
 
-        # Traditional CIL: all clients at same stage (synchronized)
-        global_stage = min(
-            len(self.client_task_sequences.get(0, [])) - 1,
-            current_round // self.cil_rounds_per_class,
-        )
-        self.active_max_class = max(0, global_stage)
+        if self.pfcl_enable:
+            # PFCL mode: Each client follows their own task sequence
+            for client in self.clients:
+                if hasattr(client, 'task_sequence') and client.task_sequence:
+                    # Calculate client's current stage based on their task sequence
+                    client_stage = min(
+                        len(client.task_sequence) - 1,
+                        current_round // self.cil_rounds_per_class,
+                    )
+                    client.cil_stage = max(0, client_stage)
+                else:
+                    # Fallback for clients without task sequences
+                    client.cil_stage = 0
+        else:
+            # Traditional CIL: all clients at same stage (synchronized)
+            global_stage = min(
+                len(self.client_task_sequences.get(0, [])) - 1,
+                current_round // self.cil_rounds_per_class,
+            )
+            self.active_max_class = max(0, global_stage)
 
-        for client in self.clients:
-            client.cil_stage = self.active_max_class
+            for client in self.clients:
+                client.cil_stage = self.active_max_class
 
     # FedAvg in PFCL mode: Pure local learning, no explicit knowledge sharing
 
@@ -54,8 +68,13 @@ class FedAvg(Server):
 
             # TIL: Set current task classes for clients
             if self.til_enable:
+                print(f"[PFTIL-FEDAVG] Round {i}: Setting current task classes for all clients")
                 for client in self.clients:
                     self._set_client_current_task(client, i)
+            else:
+                if not hasattr(self, '_til_disabled_logged'):
+                    print(f"[PFTIL-FEDAVG] TIL disabled - clients will use all classes")
+                    self._til_disabled_logged = True
 
             if i % self.eval_gap == 0:
                 print(f"\n-------------Round number: {i}-------------")
@@ -78,10 +97,22 @@ class FedAvg(Server):
             # [t.join() for t in threads]
 
             self.receive_models()
+
+            # TIL: Collect task completions and advance clients to next tasks
+            self._collect_task_completions(i)
+
             if self.dlg_eval and i % self.dlg_gap == 0:
                 self.call_dlg(i)
-            self.aggregate_parameters()
-            
+
+            # Only aggregate if not in PFCL mode (personalized learning)
+            if not self.pfcl_enable:
+                self.aggregate_parameters()
+                print(f"[PFTIL-FEDAVG] Round {i}: Parameters aggregated across {len(self.selected_clients)} clients")
+            else:
+                print(
+                    f"[PFTIL-FEDAVG] Round {i}: Skipping parameter aggregation - each client maintains personal model (PFCL mode)"
+                )
+
             # Log training losses to wandb
             if hasattr(self, 'wandb_enable') and self.wandb_enable:
                 avg_train_loss = self._collect_training_losses()

@@ -28,9 +28,6 @@ class APOP(Server):
         # Initialize budget tracking (inherited from Server)
         self.Budget = []
 
-        # Parse and assign personalized task sequences if provided
-        self._parse_and_assign_client_sequences()
-
         print(
             f"[APOP] Server initialized with {self.num_clients} clients, "
             f"subspace_dim={self.subspace_dim}, fusion_threshold={self.fusion_threshold}"
@@ -121,8 +118,13 @@ class APOP(Server):
 
             # TIL: Set current task classes for clients
             if self.til_enable:
+                print(f"[PFTIL-APOP] Round {i}: Setting current task classes for all clients")
                 for client in self.clients:
                     self._set_client_current_task(client, i)
+            else:
+                if not hasattr(self, '_til_disabled_logged'):
+                    print(f"[PFTIL-APOP] TIL disabled - clients will use all classes")
+                    self._til_disabled_logged = True
 
             if i % self.eval_gap == 0:
                 print(f"\n-------------Round number: {i}-------------")
@@ -151,8 +153,11 @@ class APOP(Server):
 
             self.receive_models()
 
-            # APOP: Collect task completion and update knowledge base
+            # TIL: Collect task completions from base server
             self._collect_task_completions(i)
+
+            # APOP: Additional task completion processing for knowledge base
+            self._apop_collect_task_completions(i)
 
             if self.dlg_eval and i % self.dlg_gap == 0:
                 self.call_dlg(i)
@@ -160,6 +165,9 @@ class APOP(Server):
             # APOP: In PFCL mode, skip global aggregation
             if not self.pfcl_enable:
                 self.aggregate_parameters()
+                print(f"[PFTIL-APOP] Round {i}: Parameters aggregated across {len(self.selected_clients)} clients")
+            else:
+                print(f"[PFTIL-APOP] Round {i}: Skipping parameter aggregation - each client maintains personal model (PFCL mode)")
 
             # Log training losses to wandb
             if hasattr(self, 'wandb_enable') and self.wandb_enable:
@@ -214,8 +222,8 @@ class APOP(Server):
             f"similarity={similarity_score:.3f}"
         )
 
-    def _collect_task_completions(self, current_round):
-        """Collect task completions and update knowledge base."""
+    def _apop_collect_task_completions(self, current_round):
+        """APOP-specific task completion processing for knowledge base."""
         for client in self.selected_clients:
             # Check if client has completed a task (simplified heuristic)
             if self.til_enable and self.cil_rounds_per_class > 0:
@@ -537,7 +545,7 @@ class APOP(Server):
         """Aggregate parameters (only in traditional FL mode)."""
         if self.pfcl_enable:
             # In PFCL mode, no aggregation - each client maintains its own model
-            print("[APOP] PFCL mode: Skipping parameter aggregation")
+            print("[PFTIL-APOP] PFCL mode: Parameter aggregation skipped - maintaining personalized models")
             return
 
         # Traditional FL aggregation
@@ -607,58 +615,6 @@ class APOP(Server):
         except Exception as e:
             print(f"[APOP-KB] Warning: Similarity computation failed: {e}")
             return 0.0
-
-    def _parse_and_assign_client_sequences(self):
-        """Parse client_sequences parameter and assign task_sequence to each client."""
-        try:
-            client_sequences = getattr(self.args, 'client_sequences', '')
-            if not client_sequences:
-                print("[APOP] No client_sequences provided, using default CIL behavior")
-                return
-
-            print(f"[APOP] Parsing client sequences: {client_sequences}")
-
-            # Parse format: "0:0,1|2,3;1:2,3|0,1;2:0,1|2,3"
-            # Format: client_id:task1_classes|task2_classes;next_client:...
-            client_assignments = {}
-
-            for client_spec in client_sequences.split(';'):
-                if ':' not in client_spec:
-                    continue
-
-                client_id_str, tasks_str = client_spec.split(':', 1)
-                client_id = int(client_id_str.strip())
-
-                # Parse tasks: "0,1|2,3" -> [[0,1], [2,3]]
-                task_sequence = []
-                for task_spec in tasks_str.split('|'):
-                    task_classes = []
-                    for class_str in task_spec.split(','):
-                        class_str = class_str.strip()
-                        if class_str:
-                            task_classes.append(int(class_str))
-                    if task_classes:
-                        task_sequence.append(task_classes)
-
-                if task_sequence:
-                    client_assignments[client_id] = task_sequence
-                    print(f"[APOP] Client {client_id} task sequence: {task_sequence}")
-
-            # Assign task sequences to clients
-            for client in self.clients:
-                if client.id in client_assignments:
-                    client.task_sequence = client_assignments[client.id]
-                    print(
-                        f"[APOP] Assigned task sequence to client {client.id}: {client.task_sequence}"
-                    )
-                else:
-                    print(
-                        f"[APOP] WARNING: No task sequence found for client {client.id}"
-                    )
-
-        except Exception as e:
-            print(f"[APOP] ERROR parsing client_sequences: {e}")
-            print("[APOP] Falling back to default CIL behavior")
 
     def _set_client_current_task(self, client, current_round):
         """Set current task classes for TIL based on personalized task sequences."""

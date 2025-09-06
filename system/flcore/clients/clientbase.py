@@ -40,9 +40,21 @@ class Client(object):
         self.cil_enable = getattr(args, 'cil_enable', False)
         self.cil_rounds_per_class = getattr(args, 'cil_rounds_per_class', 0)
 
+        # TIL: Controls task-incremental learning with output masking
+        self.til_enable = getattr(args, 'til_enable', False)
+
         # Task sequence information (set by server if CIL enabled)
         self.task_sequence = []  # List of class groups
         self.cil_stage = -1  # Current CIL stage
+        self.current_task_idx = 0  # Current task index for TIL (starts at 0)
+        self.current_task_classes = set()  # Current task's classes for TIL masking
+
+        # PFTIL Logging: Log initialization
+        print(f"[PFTIL-INIT] Client {id}: PFCL={self.pfcl_enable}, CIL={self.cil_enable}, TIL={self.til_enable}")
+        if self.cil_enable:
+            print(f"[PFTIL-INIT] Client {id}: CIL rounds per class = {self.cil_rounds_per_class}")
+        if self.til_enable:
+            print(f"[PFTIL-INIT] Client {id}: TIL masking enabled for task-incremental evaluation")
 
         # check BatchNorm
         self.has_BatchNorm = False
@@ -86,12 +98,21 @@ class Client(object):
         # PFCL: Only update parameters if not in personalized mode
         # In personalized mode, each client keeps their own model parameters
         if not self.pfcl_enable or not hasattr(self, '_model_initialized'):
+            # PFTIL Logging: Parameter update
+            if not self.pfcl_enable:
+                print(f"[PFTIL-PARAM] Client {self.id}: Updating model parameters from server (federated mode)")
+            else:
+                print(f"[PFTIL-PARAM] Client {self.id}: Initializing personalized model (PFCL first-time setup)")
+            
             for new_param, old_param in zip(
                 model.parameters(), self.model.parameters()
             ):
                 old_param.data = new_param.data.clone()
             if self.pfcl_enable:
                 self._model_initialized = True
+        else:
+            # PFTIL Logging: Parameter update skipped
+            print(f"[PFTIL-PARAM] Client {self.id}: Skipping parameter update - maintaining personalized model (PFCL mode)")
 
     def clone_model(self, model, target):
         for param, target_param in zip(model.parameters(), target.parameters()):
@@ -288,6 +309,12 @@ class Client(object):
             )
             if not allowed and stages:  # fallback to first stage
                 allowed = set(stages[0])
+            
+            # PFTIL Logging: Training data filtering (log only on task change)
+            if not hasattr(self, '_logged_train_filtering') or getattr(self, '_last_train_filter_classes', None) != allowed:
+                print(f"[PFTIL-DATA] Client {self.id}: Training data filtered to task {current} classes {allowed}")
+                self._logged_train_filtering = True
+                self._last_train_filter_classes = allowed
         else:
             # For TIL evaluation with current_task_classes set, use task-specific classes
             if (
@@ -296,12 +323,22 @@ class Client(object):
                 and self.current_task_classes
             ):
                 allowed = set(self.current_task_classes)
+                # PFTIL Logging: TIL evaluation data filtering (log only on task change)
+                if not hasattr(self, '_logged_til_eval_filtering') or getattr(self, '_last_til_eval_classes', None) != allowed:
+                    print(f"[PFTIL-DATA] Client {self.id}: TIL evaluation data filtered to current task classes {allowed}")
+                    self._logged_til_eval_filtering = True
+                    self._last_til_eval_classes = allowed
             else:
                 # Standard CIL: Eval on cumulative classes seen so far
                 allowed = set()
                 for s in range(min(stage + 1, len(stages))):
                     if s >= 0 and s < len(stages):
                         allowed.update(stages[s])
+                # PFTIL Logging: CIL evaluation data filtering (log only on stage change)
+                if not hasattr(self, '_logged_cil_eval_filtering') or getattr(self, '_last_cil_eval_classes', None) != allowed:
+                    print(f"[PFTIL-DATA] Client {self.id}: CIL evaluation data filtered to cumulative classes {allowed}")
+                    self._logged_cil_eval_filtering = True
+                    self._last_cil_eval_classes = allowed
 
         # Count original data for suspicious filtering detection
         original_class_counts = {}
@@ -390,6 +427,19 @@ class Client(object):
                 allowed.update(stages[s])
         return allowed
 
+    def advance_to_next_task(self):
+        """Advance to the next task in the sequence."""
+        if self.task_sequence and self.current_task_idx < len(self.task_sequence) - 1:
+            old_task_idx = self.current_task_idx
+            self.current_task_idx += 1
+            new_task_classes = self.task_sequence[self.current_task_idx]
+            print(f"[PFTIL-TASK] Client {self.id}: Advanced from task {old_task_idx} to task {self.current_task_idx}")
+            print(f"[PFTIL-TASK] Client {self.id}: New task classes: {new_task_classes}")
+            return True
+        else:
+            print(f"[PFTIL-TASK] Client {self.id}: Cannot advance further - at final task {self.current_task_idx}")
+        return False
+
     # ---------- TIL (Task-Incremental Learning) methods ----------
     def _mask_output_for_evaluation(self, output):
         """Mask model output to only include current task's classes for TIL evaluation."""
@@ -403,6 +453,11 @@ class Client(object):
         # Get all class indices
         all_classes = set(range(output.size(1)))
         non_task_classes = all_classes - set(task_classes)
+
+        # PFTIL Logging: Output masking for evaluation (log only once per client)
+        if not hasattr(self, '_logged_eval_masking'):
+            print(f"[PFTIL-MASK] Client {self.id}: TIL evaluation masking - allowing classes {task_classes}, masking classes {sorted(non_task_classes)}")
+            self._logged_eval_masking = True
 
         # Mask non-task classes
         for cls in non_task_classes:
@@ -428,6 +483,12 @@ class Client(object):
         # Get all class indices
         all_classes = set(range(output.size(1)))
         non_task_classes = all_classes - set(task_classes)
+        
+        # PFTIL Logging: Loss masking for training (log only once per client)
+        if not hasattr(self, '_logged_train_masking'):
+            print(f"[PFTIL-MASK] Client {self.id}: TIL training loss masking - allowing classes {task_classes}, masking classes {sorted(non_task_classes)}")
+            self._logged_train_masking = True
+        
         # Mask non-task classes
         for cls in non_task_classes:
             masked_output[:, cls] = float('-inf')
