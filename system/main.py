@@ -65,7 +65,19 @@ logger = logging.getLogger()
 logger.setLevel(logging.ERROR)
 
 warnings.simplefilter("ignore")
-torch.manual_seed(42)
+
+# Sets for reproducibility
+SEED = 42
+## pytorch
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+## numpy
+np.random.seed(SEED)
+## random
+import random
+random.seed(SEED)   
 
 
 def run(args):
@@ -131,6 +143,11 @@ def run(args):
             args.model = torchvision.models.resnet18(
                 pretrained=False, num_classes=args.num_classes
             ).to(args.device)
+            
+            # print(args.model.named_parameters)
+            # for k, (m,params) in enumerate(args.model.named_parameters()):
+            #     print(m, params.size())
+            # exit()
 
             # args.model = torchvision.models.resnet18(pretrained=True).to(args.device)
             # feature_dim = list(args.model.fc.parameters())[0].shape[1]
