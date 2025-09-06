@@ -144,6 +144,20 @@ def run(args):
                 pretrained=False, num_classes=args.num_classes
             ).to(args.device)
             
+            # initiate model with the kaiming initialization
+            for m in args.model.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
+            
             # print(args.model.named_parameters)
             # for k, (m,params) in enumerate(args.model.named_parameters()):
             #     print(m, params.size())
