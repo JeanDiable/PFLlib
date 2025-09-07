@@ -202,10 +202,12 @@ class APOP(Server):
         self._print_knowledge_base_status()
 
         # Compute final CIL/TIL metrics if enabled
-        if self.cil_enable:
+        if self.cil_enable and not self.til_enable:
+             # If only CIL is enabled, use the CIL metric computation
             self.compute_cil_metrics()
         if self.til_enable:
-            self._compute_til_final_metrics()
+            # If TIL is enabled, use our new, robust PFTIL metric computation
+            self._compute_and_log_pftil_final_metrics()
 
     def _handle_knowledge_transfer_request(self, client):
         """Handle a client's request for knowledge transfer."""

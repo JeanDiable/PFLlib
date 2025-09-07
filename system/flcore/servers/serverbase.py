@@ -1038,6 +1038,88 @@ class Server(object):
             # Log to wandb
             self._log_til_task_metrics_to_wandb(current_round, client_task_metrics)
             self._log_evaluation_metrics_to_wandb(current_round, overall_acc)
+    
+    def _compute_and_log_pftil_final_metrics(self):
+        """
+        MODIFIED: Computes and logs final PFTIL metrics (ACC, FGT) based on the
+        user's requirement of a per-client accuracy matrix.
+        This function replaces the old `_compute_til_final_metrics`.
+        """
+        if not self.til_enable or not self.task_performance_history:
+            print("[PFTIL] No TIL history available to compute final metrics.")
+            return {'ACC': 0.0, 'FGT': 0.0}
+
+        all_client_accs = []
+        all_client_fgts = []
+
+        for client in self.clients:
+            client_id = client.id
+            client_seq = self.client_task_sequences.get(client_id)
+            client_history = self.task_performance_history.get(client_id)
+
+            if not client_seq or not client_history:
+                print(f"[PFTIL] Skipping metrics for client {client_id}: missing sequence or history.")
+                continue
+
+            num_tasks = len(client_seq)
+            accuracy_matrix = np.zeros((num_tasks, num_tasks))
+
+            # Reconstruct the accuracy matrix from performance history
+            for i in range(num_tasks):  # Row: after task i is trained
+                # The evaluation round immediately after task i finishes
+                task_end_round = (i + 1) * self.cil_rounds_per_class - 1
+                
+                # Find the index in the history list corresponding to this round
+                # Note: history is stored every `eval_gap` rounds.
+                history_idx = task_end_round // self.eval_gap
+                
+                for j in range(i + 1):  # Column: evaluating on task j
+                    task_j_history = client_history.get(j, [])
+                    if len(task_j_history) > history_idx:
+                        accuracy_matrix[i, j] = task_j_history[history_idx]
+
+            print(f"\n--- Client {client_id} Final Accuracy Matrix ---")
+            # Set print options for better matrix display
+            np.set_printoptions(precision=4, suppress=True)
+            print(accuracy_matrix)
+            np.set_printoptions() # Reset to default
+
+            # 1. Calculate Average Accuracy (ACC)
+            # This is the average accuracy on all tasks after the final task is trained
+            final_accuracies = accuracy_matrix[-1, :]
+            client_acc = np.mean(final_accuracies)
+            all_client_accs.append(client_acc)
+
+            # 2. Calculate Average Forgetting (FGT)
+            forgetting_values = []
+            for j in range(num_tasks - 1): # Forgetting is not defined for the last task
+                # Accuracy on task j right after it was learned
+                acc_jj = accuracy_matrix[j, j]
+                # Accuracy on task j after all tasks were learned
+                acc_nj = accuracy_matrix[-1, j]
+                forgetting = acc_jj - acc_nj
+                forgetting_values.append(forgetting)
+            
+            client_fgt = np.mean(forgetting_values) if forgetting_values else 0.0
+            all_client_fgts.append(client_fgt)
+            
+            print(f"Client {client_id} Metrics: ACC={client_acc:.4f}, FGT={client_fgt:.4f}")
+
+        # Calculate overall average metrics
+        final_acc = np.mean(all_client_accs) if all_client_accs else 0.0
+        final_fgt = np.mean(all_client_fgts) if all_client_fgts else 0.0
+
+        print("\n--- Overall PFTIL Final Metrics ---")
+        print(f"Average Accuracy (ACC): {final_acc:.4f}")
+        print(f"Average Forgetting (FGT): {final_fgt:.4f}")
+
+        # Log final metrics to wandb
+        if self.wandb_enable and self.wandb_run:
+            self._log_til_final_metrics_to_wandb(
+                final_acc, final_fgt, all_client_accs, all_client_fgts
+            )
+
+        return {'ACC': final_acc, 'FGT': final_fgt}
 
     def _compute_til_final_metrics(self):
         """Compute final ACC and FGT metrics for TIL."""
